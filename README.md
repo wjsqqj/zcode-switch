@@ -63,3 +63,6 @@ Windows 优先（路径探测 / 进程管理 / 托盘均为 Win32 语义）。
 ## License
 
 [MIT](./LICENSE)
+
+🙏 致谢
+感谢 linuxdo 社区的交流、分享与反馈
