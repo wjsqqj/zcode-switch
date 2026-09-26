@@ -57,6 +57,14 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Z·SWITCH ${{ github.ref_name }}'
           releaseBody: |
+            本项目基于 [pjpv/zcode-switch](https://github.com/pjpv/zcode-switch) 原开源的基础上增加的功能如下：
+
+            - 添加 z.ai 邮箱登录支持和界面增强
+            - 实现 zai 登录接力机制：先通过官网登录页建立会话，再跳转到授权端点获取令牌
+            - 在 OAuth 流程中添加邮箱辅助功能，注入 JavaScript 按钮条供用户切换邮箱登录/注册
+            - 添加页面导航监控和 URL 轮询机制，确保登录完成后正确接力到授权页面
+            - 支持从手机号登录页面返回邮箱登录页面的功能
+
             见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。
 
             ## 下载
