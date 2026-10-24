@@ -75,6 +75,8 @@ export const zh = {
   "m.claimStartsAt": "额度将于 {time} 生效",
   "m.claimEndsAt": "有效期至 {time}",
   "m.claimNextAt": "，{time} 后可再领",
+  "claim.untilDate": "至 {date}",
+  "claim.historyStrip": "已领取过 {name}",
   "m.refreshClaimDone": "已刷新 {n} 个账号，{k} 个有可领套餐",
   "m.refreshClaimAcctErr": "「{name}」刷新失败：{err}",
   "m.autoClaimOn": "已开启自动领取",

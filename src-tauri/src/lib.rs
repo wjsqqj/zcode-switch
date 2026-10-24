@@ -234,6 +234,23 @@ async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ClaimCurrentResult {
+    plans: Vec<claim::ActivePlan>,
+    history: Vec<Value>,
+}
+
+#[tauri::command]
+async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
+    let paths = Paths::detect();
+    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+    let acc = load_account(&paths, &id)?;
+    let plans = claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    let history = store::claim_history_for(&paths, &id);
+    Ok(ClaimCurrentResult { plans, history })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ClaimRefreshResult {
     plans: Vec<claim::ClaimPlan>,
     activated: bool,
@@ -339,6 +356,8 @@ async fn claim_captcha_submit(
                 server_time,
             };
             let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+            // 领取成功落历史（best-effort），供「已领取生效中」展示
+            store::record_claim_history(&paths, &pending.account_id, &pending.plan_id, &pending.plan_name);
             let _ = app.emit("claim://result", &p);
             p
         }
@@ -1306,6 +1325,7 @@ pub fn run() {
             get_account_quota,
             claim_preview,
             claim_refresh,
+            claim_current,
             claim_start,
             claim_captcha_config,
             claim_captcha_submit,

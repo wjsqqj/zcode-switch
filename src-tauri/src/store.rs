@@ -262,11 +262,48 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn claim_history_file(paths: &Paths) -> PathBuf {
+    paths.store_dir().join("claim-history.json")
+}
+
+/// 领取成功后追加一条历史（仅套餐元数据，不含凭证）。失败静默（best-effort）。
+pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &str, plan_name: &str) {
+    let file = claim_history_file(paths);
+    let mut items: Vec<Value> = fs::read_to_string(&file)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let now_ms = Local::now().timestamp_millis();
+    items.push(serde_json::json!({
+        "accountId": account_id,
+        "planId": plan_id,
+        "planName": plan_name,
+        "claimedAt": now_ms,
+    }));
+    // 只保留最近 200 条，防无限增长
+    if items.len() > 200 {
+        let drop = items.len() - 200;
+        items.drain(0..drop);
+    }
+    let _ = atomic_write(&file, &serde_json::to_string(&items).unwrap_or_default());
+}
+
+/// 读取某账号的领取历史（文件损坏/缺失视为空）。
+pub(crate) fn claim_history_for(paths: &Paths, account_id: &str) -> Vec<Value> {
+    let items: Vec<Value> = fs::read_to_string(claim_history_file(paths))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    items
+        .into_iter()
+        .filter(|it| it.get("accountId").and_then(|v| v.as_str()) == Some(account_id))
+        .collect()
+}
+
 pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
     if !paths.live_file().exists() {
         return Ok(None);
-    }
-    let raw = fs::read_to_string(paths.live_file())
+    }    let raw = fs::read_to_string(paths.live_file())
         .map_err(|e| trf("err.read", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
     let v: Value = serde_json::from_str(&raw)
         .map_err(|e| trf("err.bad_json", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;

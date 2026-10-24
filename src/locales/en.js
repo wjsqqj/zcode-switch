@@ -75,6 +75,8 @@ export const en = {
   "m.claimStartsAt": "Credits activate at {time}",
   "m.claimEndsAt": "Valid until {time}",
   "m.claimNextAt": " — available again after {time}",
+  "claim.untilDate": "until {date}",
+  "claim.historyStrip": "Claimed before: {name}",
   "m.refreshClaimDone": "Refreshed {n} accounts — {k} with claimable plans",
   "m.refreshClaimAcctErr": "\"{name}\" refresh failed: {err}",
   "m.autoClaimOn": "Auto claim enabled",

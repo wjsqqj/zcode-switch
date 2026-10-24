@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
+pub const BILLING_CURRENT_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/current";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
 pub const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch?seq=0";
@@ -449,6 +450,73 @@ pub fn merge_marketing_plans(mut base: Vec<ClaimPlan>, extra: Vec<ClaimPlan>) ->
     base
 }
 
+/// 已生效套餐（billing/current）：区分「无活动」与「已领取生效中」。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActivePlan {
+    pub user_plan_id: String,
+    pub plan_id: String,
+    pub name: String,
+    pub status: String,
+    pub starts_at: Option<i64>,
+    pub ends_at: Option<i64>,
+    pub grant_items: Vec<ClaimGrant>,
+}
+
+pub fn fetch_active_plans(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<Vec<ActivePlan>, String> {
+    let secret = zcrypto::default_secret(home);
+    let token = claim_token(creds, config, &secret)?;
+    let url = format!(
+        "{BILLING_CURRENT_URL}?app_version={}&platform={}",
+        quota::zcode_app_version(),
+        quota::client_platform()
+    );
+    let mut req = agent().get(&url);
+    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = req
+        .call()
+        .map_err(|e| http_err(&crate::i18n::tr("err.claim.preview_req"), e))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(failure_message(code, &v));
+    }
+    let plans = v
+        .pointer("/data/plans")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out: Vec<ActivePlan> = plans
+        .iter()
+        .filter_map(|p| {
+            let plan_id = str_field(p, "plan_id", "planId")?.trim().to_string();
+            if plan_id.is_empty() {
+                return None;
+            }
+            let grant_items = parse_entitlements(p);
+            Some(ActivePlan {
+                user_plan_id: str_field(p, "user_plan_id", "userPlanId").unwrap_or("").to_string(),
+                plan_id,
+                name: p.get("name").and_then(|s| s.as_str()).unwrap_or("").trim().to_string(),
+                status: str_field(p, "status", "status").unwrap_or("").to_string(),
+                starts_at: p.get("starts_at").and_then(|x| x.as_i64()).map(|s| s * 1000),
+                ends_at: p.get("ends_at").and_then(|x| x.as_i64()).map(|s| s * 1000),
+                grant_items,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.ends_at.cmp(&a.ends_at).then(a.plan_id.cmp(&b.plan_id)));
+    Ok(out)
+}
+
 /// 可领套餐统一查询入口：billing/preview（错误上抛，保持既有报错体验）
 /// + marketing/touch 活动套餐（失败静默为空）。
 pub fn collect_claimable_plans(
@@ -575,13 +643,8 @@ fn num_field(e: &Value, snake: &str, camel: &str) -> Option<f64> {
         .or_else(|| e.get(camel).and_then(|v| v.as_f64()))
 }
 
-fn parse_plan(p: &Value) -> Option<ClaimPlan> {
-    let plan_id = str_field(p, "plan_id", "planId")?.trim().to_string();
-    if plan_id.is_empty() {
-        return None;
-    }
-    let grant_items: Vec<ClaimGrant> = p
-        .get("entitlements")
+fn parse_entitlements(p: &Value) -> Vec<ClaimGrant> {
+    p.get("entitlements")
         .and_then(|e| e.as_array())
         .map(|arr| {
             arr.iter()
@@ -599,7 +662,15 @@ fn parse_plan(p: &Value) -> Option<ClaimPlan> {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn parse_plan(p: &Value) -> Option<ClaimPlan> {
+    let plan_id = str_field(p, "plan_id", "planId")?.trim().to_string();
+    if plan_id.is_empty() {
+        return None;
+    }
+    let grant_items = parse_entitlements(p);
     let grants = grant_items
         .iter()
         .map(|g| {

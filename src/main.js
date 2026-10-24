@@ -11,6 +11,7 @@ let busy = false;
 let appVer = "";
 let acctQuota = {};
 let claimable = {};
+let claimedState = {};
 let claimAllRunning = false;
 const REFRESH_CLAIM_COOLDOWN_MS = 60_000;
 let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
@@ -120,6 +121,21 @@ async function awaitClaimPreviewFresh(id) {
     claimable[id] = { plans: plans || [], err: null, busy: false };
   } catch (e) {
     claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
+  }
+}
+
+// 已领取状态（billing/current + 本地历史）：区分「无活动」与「已领取生效中」。
+// current 失败静默——可领列表优先展示，不受影响。
+async function fetchClaimed(id) {
+  try {
+    const r = await invoke("claim_current", { id });
+    claimedState[id] = { plans: r.plans || [], history: r.history || [], err: null };
+  } catch (e) {
+    claimedState[id] = {
+      plans: claimedState[id]?.plans || [],
+      history: claimedState[id]?.history || [],
+      err: String(e),
+    };
   }
 }
 
@@ -323,6 +339,7 @@ const actions = {
       toast(t("m.claimVerify", { name: plan.name || plan.plan_id }), "ok", t("m.claimVerifyDetail"));
       const r = await waitForClaimResult(id);
       if (!r) toast(t("m.claimTimeout"), "warn");
+      else if (r.ok !== false) await fetchClaimed(id);
     } catch (e) {
       toast(stripErr(e), "err");
     } finally {
@@ -353,6 +370,8 @@ const actions = {
         if (!r) {
           toast(t("m.claimAcctTimeout", { name }), "warn");
           await invoke("claim_cancel").catch(() => {});
+        } else if (r.ok !== false) {
+          await fetchClaimed(id);
         }
         if (i < ids.length - 1) await new Promise((res) => setTimeout(res, 1200));
       }
@@ -398,6 +417,7 @@ const actions = {
         try {
           const r = await invoke("claim_refresh", { id });
           claimable[id] = { plans: r.plans || [], err: null, busy: false };
+          await fetchClaimed(id);
           if ((r.plans || []).length) okCount++;
           if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
         } catch (e) {
@@ -434,6 +454,7 @@ const actions = {
     try {
       const r = await invoke("claim_refresh", { id });
       claimable[id] = { plans: r.plans || [], err: null, busy: false };
+      await fetchClaimed(id);
       if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
     } catch (e) {
       claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
@@ -569,6 +590,7 @@ async function autoClaimTick() {
         }
         gotAny = true; roundClaimed++;
         await awaitClaimPreviewFresh(id);
+        await fetchClaimed(id);
         if (!uiLocked()) render();
         progressed = true;
         await new Promise((res) => setTimeout(res, 1200));
@@ -737,6 +759,37 @@ function planGroupHtml(p) {
   </div>`;
 }
 
+function claimedStripHtml(id) {
+  const cs = claimedState[id];
+  if (!cs) return "";
+  const grants = (p) => (p.grant_items || [])
+    .map((g) => `${g.name} ${fmtTokens(g.units)}`)
+    .join(" · ");
+  const date = (ms) => ms
+    ? new Date(ms).toLocaleString(localeTag(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
+    : "";
+  const active = (cs.plans || []).filter((p) => !p.status || p.status === "active");
+  let html = active.map((p) => `
+    <div class="claim-strip claimed" title="${esc(p.name || p.plan_id)}">
+      ${ic("gift", 15)}
+      <span class="claim-name">${esc(p.name || p.plan_id)}</span>
+      ${grants(p) ? `<span class="claim-grants">${esc(grants(p))}</span>` : ""}
+      ${p.ends_at ? `<span class="claim-grants">${esc(t("claim.untilDate", { date: date(p.ends_at) }))}</span>` : ""}
+    </div>`).join("");
+  if (!active.length && (cs.history || []).length) {
+    const last = cs.history[cs.history.length - 1];
+    const name = last?.planName || last?.planId || "";
+    if (name) {
+      html += `
+      <div class="claim-strip history">
+        ${ic("gift", 15)}
+        <span class="claim-name">${esc(t("claim.historyStrip", { name }))}</span>
+      </div>`;
+    }
+  }
+  return html;
+}
+
 function acctQuotaSlot(id) {
   const strip = claimStripHtml(id);
   const q = acctQuota[id];
@@ -760,8 +813,9 @@ function acctQuotaSlot(id) {
       }
     }
   }
-  if (!strip && !inner) return `<div class="row-quota-slot"></div>`;
-  return `<div class="row-quota-slot">${strip}${inner}</div>`;
+  const claimed = claimedStripHtml(id);
+  if (!strip && !claimed && !inner) return `<div class="row-quota-slot"></div>`;
+  return `<div class="row-quota-slot">${strip}${claimed}${inner}</div>`;
 }
 
 function captureScroll() {

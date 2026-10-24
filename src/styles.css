@@ -1036,3 +1036,13 @@ input:focus-visible,
 .pv-item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .pv-item .pv-arrow { color: var(--ink-mute); font-family: var(--mono); }
 .pv-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+
+.claim-strip.claimed {
+  border-color: rgba(94, 178, 122, .42);
+  background: rgba(94, 178, 122, .08);
+  color: #5eb27a;
+}
+.claim-strip.history {
+  opacity: .55;
+  border-style: dashed;
+}
