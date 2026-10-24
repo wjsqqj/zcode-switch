@@ -1509,3 +1509,19 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
         plans: slots,
     }
 }
+
+#[cfg(test)]
+mod version_tests {
+    use super::version_ge;
+
+    #[test]
+    fn version_ge_semantics() {
+        assert!(version_ge("3.16.3", "3.16.3"));
+        assert!(version_ge("3.16.3", "3.11.2"));
+        assert!(!version_ge("3.11.2", "3.16.3"));
+        assert!(version_ge("3.16.3", "3.16.3.0"));
+        assert!(!version_ge("3.9", "3.10"));
+        assert!(version_ge("4.0", "3.99.99"));
+        assert!(version_ge("3.16", "3.16.0"));
+    }
+}

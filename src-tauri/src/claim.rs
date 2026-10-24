@@ -7,11 +7,31 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
-pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
-pub const BILLING_CURRENT_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/current";
-pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
-pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
-pub const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch?seq=0";
+/// 上游基址：测试经 ZCODE_API_BASE 旁路指向本地 mock（默认官方）。
+pub const API_BASE_DEFAULT: &str = "https://zcode.z.ai";
+
+pub(crate) fn api_base() -> String {
+    std::env::var("ZCODE_API_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| API_BASE_DEFAULT.to_string())
+}
+
+pub(crate) fn billing_preview_url() -> String {
+    format!("{}/api/v1/zcode-plan/billing/preview", api_base())
+}
+pub(crate) fn billing_current_url() -> String {
+    format!("{}/api/v1/zcode-plan/billing/current", api_base())
+}
+pub(crate) fn billing_claim_url() -> String {
+    format!("{}/api/v1/zcode-plan/billing/claim", api_base())
+}
+pub(crate) fn client_configs_url() -> String {
+    format!("{}/api/v1/client/configs", api_base())
+}
+pub(crate) fn marketing_touch_url() -> String {
+    format!("{}/api/v1/marketing/touch?seq=0", api_base())
+}
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
@@ -246,7 +266,8 @@ pub fn preview_plans(
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
     let url = format!(
-        "{BILLING_PREVIEW_URL}?app_version={}&platform={}",
+        "{}?app_version={}&platform={}",
+        billing_preview_url(),
         quota::zcode_app_version(),
         quota::client_platform()
     );
@@ -353,7 +374,7 @@ pub fn marketing_touch_plans(
         Ok(t) => t,
         Err(e) => return fail(&e),
     };
-    let mut req = agent().get(MARKETING_TOUCH_URL);
+    let mut req = agent().get(&marketing_touch_url());
     for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
         req = req.set(&k, &v);
     }
@@ -471,7 +492,8 @@ pub fn fetch_active_plans(
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
     let url = format!(
-        "{BILLING_CURRENT_URL}?app_version={}&platform={}",
+        "{}?app_version={}&platform={}",
+        billing_current_url(),
         quota::zcode_app_version(),
         quota::client_platform()
     );
@@ -544,7 +566,7 @@ pub fn submit_claim(
     }
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
-    let mut req = agent().post(BILLING_CLAIM_URL);
+    let mut req = agent().post(&billing_claim_url());
     for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
         req = req.set(&k, &v);
     }
@@ -569,13 +591,14 @@ pub fn submit_claim(
     Ok(v)
 }
 
+static CAPTCHA_CONFIG_CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, Option<CaptchaConfig>)>> =
+    std::sync::OnceLock::new();
+const CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
     // 缓存 600s（上游配置低频变化）；失败回退上次成功值，再无则内置默认，
     // 保证领取流程不因配置接口抖动而中断。
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, Option<CaptchaConfig>)>> =
-        std::sync::OnceLock::new();
-    const CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - CONFIG_TTL, None)));
+    let cache = CAPTCHA_CONFIG_CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - CONFIG_TTL, None)));
     let mut slot = cache.lock().unwrap_or_else(|p| p.into_inner());
     if slot.1.is_some() && slot.0.elapsed() < CONFIG_TTL {
         return Ok(slot.1.clone().unwrap());
@@ -607,8 +630,17 @@ fn default_captcha_config() -> CaptchaConfig {
     }
 }
 
+/// 仅供测试：清空验证码配置缓存（否则 600s TTL 会污染相邻用例）。
+#[doc(hidden)]
+pub fn reset_captcha_config_cache_for_tests() {
+    if let Some(m) = CAPTCHA_CONFIG_CACHE.get() {
+        let mut slot = m.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = (std::time::Instant::now() - CONFIG_TTL, None);
+    }
+}
+
 fn fetch_captcha_config_remote() -> Result<CaptchaConfig, String> {
-    let mut req = agent().get(CLIENT_CONFIGS_URL);
+    let mut req = agent().get(&client_configs_url());
     for (k, v) in quota::zai_billing_headers("") {
         req = req.set(&k, &v);
     }

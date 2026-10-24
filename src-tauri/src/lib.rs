@@ -1,8 +1,8 @@
 pub mod cipher;
 pub mod cli;
 pub mod i18n;
-mod changelog;
-mod claim;
+pub mod changelog;
+pub mod claim;
 mod flowlog;
 mod oauth;
 mod probe;
