@@ -1,0 +1,32 @@
+{
+  "id": "absorb-oss-lessons",
+  "name": "absorb-oss-lessons",
+  "title": "吸收开源项目经验：版本保鲜/领取加固/已领取状态/风控防线/mock 测试",
+  "description": "父任务：从 zcode-proxy/zcode2api/zcode-plan-claim/zcode-butler 四个开源项目吸收实战经验，交付 5 个子任务：A changelog 版本保鲜、B 领取链路加固、C 已领取状态展示、D 风控退避与额度防线、E 上游 mock 测试体系",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "qqj",
+  "assignee": "qqj",
+  "createdAt": "2026-10-24",
+  "completedAt": "2026-10-24",
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "10-24-changelog-version",
+    "10-24-claim-hardening",
+    "10-24-claimed-state",
+    "10-24-risk-quota-guard",
+    "10-24-mock-upstream-tests"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
