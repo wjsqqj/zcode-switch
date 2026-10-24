@@ -130,6 +130,15 @@ pub(crate) fn client_timezone() -> String {
 }
 
 pub(crate) fn zcode_app_version() -> String {
+    let detected = detected_app_version();
+    // changelog 缓存只读文件（后台线程负责保鲜），过期旧值仍参与 max——旧值也比常量新鲜
+    match crate::changelog::cached_latest(&crate::store::Paths::detect().home) {
+        Some(v) if version_ge(&v, &detected) => v,
+        _ => detected,
+    }
+}
+
+fn detected_app_version() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {

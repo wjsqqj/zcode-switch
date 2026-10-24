@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/10-24-marketing-touch-claim/prd.md", "reason": "需求、根因实证、已确认决策（版本max策略/直接合并/纳入自动领取/静默降级）与验收标准"}
+{"file": ".trellis/tasks/10-24-marketing-touch-claim/design.md", "reason": "技术设计：marketing_touch_plans 解析规则、版本 max 策略、lib.rs 合并层、前端每账号刷新交互"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "改常量/新增函数前先搜索既有实现（parse_plan、zai_billing_headers_with_mid、claim_token 复用）"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "前后端跨层数据流：合并发生在 Rust 层，前端零渲染改动；确认层边界不被打破"}
