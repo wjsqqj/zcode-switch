@@ -105,6 +105,7 @@ export const en = {
   "btn.autoClaim": "Auto claim",
   "btn.autoClaimTitle": "When on, checks claimable plans every 10 min and claims automatically (activates eligibility once per account first; captcha solved silently, alerts if manual verification needed)",
   "btn.claim": "Claim",
+  "btn.acctRefreshTitle": "Refresh this account's event eligibility and claimable plans (rate-limited)",
   "btn.refreshClaim": "Refresh",
   "btn.refreshClaimTitle": "Activate event eligibility for every account and re-check claimable plans (rate-limited)",
   "btn.refreshClaimRunning": "Refresh {done}/{total}",

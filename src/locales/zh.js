@@ -105,6 +105,7 @@ export const zh = {
   "btn.autoClaim": "自动领取",
   "btn.autoClaimTitle": "开启后每 10 分钟自动检测可领套餐并领取（每号先激活一次活动资格；验证码静默通过，需人工验证时提醒）",
   "btn.claim": "领取",
+  "btn.acctRefreshTitle": "刷新此账号的活动资格与可领套餐（有频率限制）",
   "btn.refreshClaim": "刷新资格",
   "btn.refreshClaimTitle": "为全部账号激活活动资格并重新查询可领套餐（有频率限制）",
   "btn.refreshClaimRunning": "刷新资格 {done}/{total}",

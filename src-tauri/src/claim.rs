@@ -1,4 +1,5 @@
 
+use crate::flowlog;
 use crate::quota;
 use crate::zcrypto;
 use serde::Serialize;
@@ -9,6 +10,7 @@ use std::time::Duration;
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
+pub const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch?seq=0";
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
@@ -267,6 +269,135 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
     let mut out: Vec<ClaimPlan> = plans.iter().filter_map(parse_plan).collect();
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
     Ok(out)
+}
+
+/// 营销触达通道：新版活动（客户端弹窗/banner）只经 marketing/touch 下发，billing/preview 不返回。
+/// deliveries 的按钮带可领 plan_id（action.type = claim_zcode_plan），payload 在 background/hero 的
+/// args.zcode_plan 内嵌完整套餐结构（字段与 preview plans 同构）。任何失败静默降级为空列表并记本地
+/// 日志，不影响 preview 结果。
+pub fn marketing_touch_plans(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Vec<ClaimPlan> {
+    let fail = |detail: &str| -> Vec<ClaimPlan> {
+        flowlog::log("claim", "marketing-fail", detail);
+        Vec::new()
+    };
+    let secret = zcrypto::default_secret(home);
+    let token = match claim_token(creds, config, &secret) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
+    };
+    let mut req = agent().get(MARKETING_TOUCH_URL);
+    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(e) => return fail(&http_err("marketing", e)),
+    };
+    let resp = match resp.into_string() {
+        Ok(s) => s,
+        Err(e) => return fail(&crate::i18n::trf("err.http.read", &[("e", &e.to_string())])),
+    };
+    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
+    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+        return fail(&format!("code {}", v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1)));
+    }
+    let mut payloads: Vec<ClaimPlan> = Vec::new();
+    let mut button_ids: Vec<String> = Vec::new();
+    for d in v
+        .pointer("/data/deliveries")
+        .and_then(|d| d.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        walk_marketing_delivery(d, &mut payloads, &mut button_ids);
+    }
+    let missing: Vec<String> = button_ids
+        .iter()
+        .filter(|id| !payloads.iter().any(|p| &p.plan_id == *id))
+        .cloned()
+        .collect();
+    for id in missing {
+        payloads.push(ClaimPlan {
+            plan_id: id.clone(),
+            name: id,
+            description: String::new(),
+            priority: 0,
+            grants: vec![],
+            grant_items: vec![],
+        });
+    }
+    let mut out: Vec<ClaimPlan> = payloads;
+    out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    out.dedup_by(|a, b| a.plan_id == b.plan_id);
+    out
+}
+
+fn walk_marketing_delivery(v: &Value, payloads: &mut Vec<ClaimPlan>, button_ids: &mut Vec<String>) {
+    match v {
+        Value::Array(items) => {
+            for it in items {
+                walk_marketing_delivery(it, payloads, button_ids);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(action) = map.get("action").and_then(|a| a.as_object()) {
+                let ty = action.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if ty == "claim_zcode_plan" || ty == "claim_plan" {
+                    let id = action
+                        .get("args")
+                        .and_then(|a| a.get("plan_id"))
+                        .and_then(|p| p.as_str())
+                        .or_else(|| action.get("planId").and_then(|p| p.as_str()))
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    if let Some(id) = id {
+                        button_ids.push(id.to_string());
+                    }
+                }
+            }
+            let is_plan_payload = map.get("plan_id").and_then(|p| p.as_str()).is_some_and(|s| !s.trim().is_empty())
+                && (map.get("entitlements").and_then(|e| e.as_array()).is_some()
+                    || map.get("name").and_then(|n| n.as_str()).is_some());
+            if is_plan_payload {
+                if let Some(plan) = parse_plan(v) {
+                    payloads.push(plan);
+                }
+            }
+            for val in map.values() {
+                walk_marketing_delivery(val, payloads, button_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 合并 marketing/touch 活动套餐到 preview 结果：按 plan_id 去重（preview 优先），priority 降序。
+pub fn merge_marketing_plans(mut base: Vec<ClaimPlan>, extra: Vec<ClaimPlan>) -> Vec<ClaimPlan> {
+    for p in extra {
+        if !base.iter().any(|b| b.plan_id == p.plan_id) {
+            base.push(p);
+        }
+    }
+    base.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    base
+}
+
+/// 可领套餐统一查询入口：billing/preview（错误上抛，保持既有报错体验）
+/// + marketing/touch 活动套餐（失败静默为空）。
+pub fn collect_claimable_plans(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: String,
+) -> Result<Vec<ClaimPlan>, String> {
+    let plans = preview_plans(home, creds, config, Some(device_mid.clone()))?;
+    let extra = marketing_touch_plans(home, creds, config, Some(device_mid));
+    Ok(merge_marketing_plans(plans, extra))
 }
 
 pub fn submit_claim(
