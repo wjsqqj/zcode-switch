@@ -58,6 +58,24 @@ pub struct ClaimError {
     pub next_at: Option<i64>,
 }
 
+impl ClaimError {
+    /// 3007：验证码校验失败（参数缺失/过期/已用），可换新验证码参数重试一次。
+    pub fn is_captcha_rejected(&self) -> bool {
+        self.code == 3007
+    }
+    /// 1001~1005：终态失败（套餐不存在/活动结束/已领取/不符条件/名额用完），不应重试。
+    pub fn is_terminal(&self) -> bool {
+        (1001..=1005).contains(&self.code)
+    }
+    /// HTTP 401/403 但携带验证码挑战特征：是风控人机校验而非凭证失效，不得按登录过期处理。
+    pub fn is_challenge(&self) -> bool {
+        self.code == CLAIM_ERR_CHALLENGE
+    }
+}
+
+/// 非 claim 业务码的保留语义码：HTTP 401/403 携带验证码挑战特征。
+pub const CLAIM_ERR_CHALLENGE: i64 = -2;
+
 impl From<String> for ClaimError {
     fn from(message: String) -> Self {
         ClaimError {
@@ -96,6 +114,8 @@ pub fn failure_payload(
         "planName": plan_name,
         "code": err.code,
         "nextAt": err.next_at,
+        "terminal": err.is_terminal(),
+        "challenge": err.is_challenge(),
         "message": err.message,
     })
 }
@@ -244,6 +264,48 @@ fn http_err(prefix: &str, e: ureq::Error) -> String {
         return format!("{prefix} HTTP {code}: {msg}");
     }
     format!("{prefix} {e}")
+}
+
+/// claim 写请求的 HTTP 错误分类：401/403 若携带验证码挑战特征（响应头
+/// x-aliyun-captcha-verify-param 或 body 含 captcha 字样），归类为「需过人机校验」
+/// 而非凭证失效（zcode2api 实测教训：一次人机校验就把健康账号当登录过期会错杀）。
+fn classify_claim_http_err(prefix: &str, e: ureq::Error) -> ClaimError {
+    let status = match &e {
+        ureq::Error::Status(s, _) => *s,
+        _ => 0,
+    };
+    if status == 401 || status == 403 {
+        if let ureq::Error::Status(_, resp) = e {
+            let challenged = resp.header("x-aliyun-captcha-verify-param").is_some();
+            let body = resp.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            if challenged || body.to_lowercase().contains("captcha") {
+                return ClaimError {
+                    code: CLAIM_ERR_CHALLENGE,
+                    message: crate::i18n::tr("claim.fail.challenge"),
+                    next_at: None,
+                };
+            }
+            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            if code > 0 {
+                return claim_error(code, &v);
+            }
+            let msg = ["msg", "message", "error"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or_default();
+            return ClaimError {
+                code: -1,
+                message: format!("{prefix} HTTP {status}: {msg}"),
+                next_at: None,
+            };
+        }
+    }
+    ClaimError {
+        code: -1,
+        message: http_err(prefix, e),
+        next_at: None,
+    }
 }
 
 fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
@@ -424,11 +486,7 @@ pub fn submit_claim(
     }
     let resp = req
         .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: http_err(&crate::i18n::tr("err.claim.claim_req"), e),
-            next_at: None,
-        })?
+        .map_err(|e| classify_claim_http_err(&crate::i18n::tr("err.claim.claim_req"), e))?
         .into_string()
         .map_err(|e| ClaimError {
             code: -1,
@@ -444,6 +502,44 @@ pub fn submit_claim(
 }
 
 pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
+    // 缓存 600s（上游配置低频变化）；失败回退上次成功值，再无则内置默认，
+    // 保证领取流程不因配置接口抖动而中断。
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, Option<CaptchaConfig>)>> =
+        std::sync::OnceLock::new();
+    const CONFIG_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now() - CONFIG_TTL, None)));
+    let mut slot = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.1.is_some() && slot.0.elapsed() < CONFIG_TTL {
+        return Ok(slot.1.clone().unwrap());
+    }
+    match fetch_captcha_config_remote() {
+        Ok(cfg) => {
+            *slot = (std::time::Instant::now(), Some(cfg.clone()));
+            Ok(cfg)
+        }
+        Err(e) => {
+            flowlog::log("claim", "captcha-config-fail", &e);
+            if let Some(cfg) = &slot.1 {
+                return Ok(cfg.clone());
+            }
+            let def = default_captcha_config();
+            *slot = (std::time::Instant::now(), Some(def.clone()));
+            Ok(def)
+        }
+    }
+}
+
+fn default_captcha_config() -> CaptchaConfig {
+    // 来源：client/configs 长期观测值，zcode2api constants.py 与 plan-claim CLAIM-LOGIC §3.4 一致
+    CaptchaConfig {
+        enabled: true,
+        region: "cn".into(),
+        prefix: "no8xfe".into(),
+        scene_id: "11xygtvd".into(),
+    }
+}
+
+fn fetch_captcha_config_remote() -> Result<CaptchaConfig, String> {
     let mut req = agent().get(CLIENT_CONFIGS_URL);
     for (k, v) in quota::zai_billing_headers("") {
         req = req.set(&k, &v);

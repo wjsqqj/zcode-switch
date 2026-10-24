@@ -487,10 +487,27 @@ function stopRefreshTickerIfIdle() {
 
 function autoClaimCooldownFor(r) {
   const now = Date.now();
-  if (r.code === 1005 && r.nextAt) return r.nextAt;
-  if (Number.isFinite(r.code) && r.code >= 1000) return now + 60 * 60 * 1000;
+  // plan 级终态/1005 由 claimHold 记忆（见 holdForClaim），账号级只拦交互卡死与流程异常
   if (r.code === "interactive") return now + 60 * 60 * 1000;
+  if (Number.isFinite(r.code) && r.code >= 1000) return 0;
   return now + AUTO_CLAIM_INTERVAL_MS;
+}
+
+// (账号|套餐) 级领取记忆：终态不重试、1005 等到 nextAt，避免浪费验证码求解与上游写请求
+let claimHold = {};
+const claimHoldKey = (id, planId) => `${id}|${planId}`;
+function holdForClaim(r) {
+  const now = Date.now();
+  if (r.terminal && r.code === 1005) {
+    return Number.isFinite(r.nextAt) && r.nextAt > now ? r.nextAt : now + 60 * 60 * 1000;
+  }
+  if (r.terminal) return Infinity;
+  if (r.challenge || r.code === 3007) return now + 10 * 60 * 1000;
+  return now + 60 * 60 * 1000;
+}
+function pickAutoPlan(id) {
+  const plans = claimable[id]?.plans || [];
+  return plans.find((p) => (claimHold[claimHoldKey(id, p.plan_id)] ?? 0) <= Date.now()) || null;
 }
 
 async function autoClaimTick() {
@@ -530,7 +547,7 @@ async function autoClaimTick() {
         if (autoAbortRequested) break;
         attempts++;
         progressed = false;
-        const plan = claimable[id]?.plans?.[0];
+        const plan = pickAutoPlan(id);
         if (!plan) break;
         try {
           await invoke("claim_start", { id, planId: plan.plan_id, auto: true });
@@ -546,6 +563,7 @@ async function autoClaimTick() {
           break;
         }
         if (r.ok === false) {
+          claimHold[claimHoldKey(id, plan.plan_id)] = holdForClaim(r);
           autoClaimCooldown[id] = autoClaimCooldownFor(r);
           break;
         }

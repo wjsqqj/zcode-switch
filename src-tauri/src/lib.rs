@@ -23,6 +23,7 @@ const TRAY_ID: &str = "main";
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Clone)]
 struct PendingClaim {
     account_id: String,
     account_name: String,
@@ -31,6 +32,15 @@ struct PendingClaim {
     credentials: Value,
     config: Option<Value>,
     device_mid: String,
+    /// 验证码提交次数（1 起）。3007 允许换新参数重试一次（共 2 次）。
+    captcha_attempt: u8,
+}
+
+impl PendingClaim {
+    fn with_attempt(mut self, n: u8) -> Self {
+        self.captcha_attempt = n;
+        self
+    }
 }
 
 static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
@@ -272,6 +282,7 @@ async fn claim_start(
         credentials: acc.credentials,
         config: acc.config,
         device_mid: mid,
+        captcha_attempt: 1,
     });
     open_captcha_window(&app, auto.unwrap_or(false))?;
     Ok(json!({ "account": acc.name, "plan": display }))
@@ -297,8 +308,16 @@ async fn claim_captcha_submit(
         &pending.plan_id,
         &param,
         region.as_deref(),
-        Some(pending.device_mid),
+        Some(pending.device_mid.clone()),
     );
+    // 3007：验证码校验失败（参数过期/已用）。第一次时把 pending 放回、不关窗口、
+    // 不发终态事件，让验证码窗口拿新参数自动重试一次（plan-claim 纪律：仅重试一次）。
+    if let Err(e) = &res {
+        if e.is_captcha_rejected() && pending.captcha_attempt == 1 {
+            *pending_guard() = Some(pending.clone().with_attempt(2));
+            return Ok(json!({ "retry": true, "code": e.code, "message": e.message }));
+        }
+    }
     close_captcha_window(&app);
     let payload = match res {
         Ok(v) => {

@@ -37,9 +37,10 @@ function loadSdk() {
   });
 }
 
-let submitted = false;
+let submitting = false;
 let region = null;
 let tracelessTimer = 0;
+let captchaInstance = null;
 
 async function run() {
   try {
@@ -79,15 +80,26 @@ async function run() {
 
   status(t("c.traceless"));
 
-  const submit = (param) => {
-    if (submitted || !param || !param.trim()) return;
-    submitted = true;
+  // 3007（验证码校验失败：参数过期/已用）→ 后端放回 pending 并返回 retry=true，
+  // 这里重建验证码实例拿新参数自动重试一次（后端保证只放回一次，第二次 3007 走终态）。
+  const submit = async (param) => {
+    if (submitting || !param || !param.trim()) return;
+    submitting = true;
     clearTimeout(tracelessTimer);
     status(t("c.passed"));
-    invoke("claim_captcha_submit", { param, region }).catch((e) => {
+    try {
+      const r = await invoke("claim_captcha_submit", { param, region });
+      if (r && r.retry) {
+        submitting = false;
+        status(t("c.retrying"));
+        await new Promise((res) => setTimeout(res, 600));
+        startCaptcha();
+        return;
+      }
+    } catch (e) {
       status(t("c.claimReqFail"), "err");
       detail(stripErr(e));
-    });
+    }
   };
 
   const interactive = (why) => {
@@ -99,31 +111,41 @@ async function run() {
     if (why) detail(typeof why === "string" ? why.slice(0, 120) : JSON.stringify(why).slice(0, 120));
   };
 
-  try {
-    window.initAliyunCaptcha({
-      SceneId: cfg.scene_id,
-      mode: "popup",
-      language: lang() === "en" ? "en" : "zh-CN",
-      showErrorTip: false,
-      element: "#cap-holder",
-      button: "#cap-btn",
-      getInstance: (instance) => {
-        if (typeof instance.startTracelessVerification === "function") {
-          instance.startTracelessVerification();
-          tracelessTimer = setTimeout(interactive, TRACELESS_TIMEOUT);
-        } else {
-          interactive();
-        }
-      },
-      success: (param) => submit(typeof param === "string" ? param : param?.captchaVerifyParam),
-      fail: (p) => interactive(p),
-      onError: (p) => interactive(p),
-    });
-  } catch (e) {
-    notifyStuck();
-    status(t("c.initFail"), "err");
-    detail(String(e));
+  function startCaptcha() {
+    try {
+      captchaInstance?.destroy?.();
+    } catch { }
+    captchaInstance = null;
+    $btn.hidden = true;
+    try {
+      window.initAliyunCaptcha({
+        SceneId: cfg.scene_id,
+        mode: "popup",
+        language: lang() === "en" ? "en" : "zh-CN",
+        showErrorTip: false,
+        element: "#cap-holder",
+        button: "#cap-btn",
+        getInstance: (instance) => {
+          captchaInstance = instance;
+          if (typeof instance.startTracelessVerification === "function") {
+            instance.startTracelessVerification();
+            tracelessTimer = setTimeout(interactive, TRACELESS_TIMEOUT);
+          } else {
+            interactive();
+          }
+        },
+        success: (param) => submit(typeof param === "string" ? param : param?.captchaVerifyParam),
+        fail: (p) => interactive(p),
+        onError: (p) => interactive(p),
+      });
+    } catch (e) {
+      notifyStuck();
+      status(t("c.initFail"), "err");
+      detail(String(e));
+    }
   }
+
+  startCaptcha();
 }
 
 $btn.addEventListener("click", () => {
