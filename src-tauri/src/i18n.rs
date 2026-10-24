@@ -218,6 +218,10 @@ const ZH: &[(&str, &str)] = &[
     ("cli.unknown_cmd", "未知子命令：{cmd}"),
     ("cli.read_fail", "读取失败：{e}"),
     ("cli.json_fail", "JSON 解析失败：{e}"),
+    ("err.risk.cooling", "账号风控冷却中（约 {mins} 分钟后恢复），已暂停自动查询与领取"),
+    ("err.risk.cooling_auto", "账号风控冷却中，本轮自动领取已跳过"),
+    ("err.risk.cooling", "Account is risk-cooling (recovers in ~{mins} min). Auto polling and claiming paused"),
+    ("err.risk.cooling_auto", "Account is risk-cooling — this auto round was skipped"),
     ("err.lang.unknown", "未知语言：{lang}（支持 zh / en）"),
 ];
 

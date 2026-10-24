@@ -130,6 +130,7 @@ export const zh = {
   "btn.renameMeta": "回车保存 · Esc 取消",
 
   "q.loading": "查询中…",
+  "q.bonusActive": "一次性赠送池生效中（见上方绿色条目），实际可用额度以请求为准",
   "q.unknown": "未知",
   "q.validUntil": "有效期至 {date}",
   "q.validUntilShort": "至 {date}",

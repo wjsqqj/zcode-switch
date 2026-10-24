@@ -130,6 +130,7 @@ export const en = {
   "btn.renameMeta": "Enter to save · Esc to cancel",
 
   "q.loading": "Querying…",
+  "q.bonusActive": "One-time bonus pool active (see green strip above) — actual quota is enforced server-side",
   "q.unknown": "unknown",
   "q.validUntil": "Valid until {date}",
   "q.validUntilShort": "until {date}",

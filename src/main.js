@@ -78,13 +78,13 @@ async function guard(fn) {
   }
 }
 
-async function loadAcctQuota(id) {
+async function loadAcctQuota(id, force = false) {
   const cur = acctQuota[id] || {};
   if (cur.busy) return;
   acctQuota[id] = { busy: true };
   if (!uiLocked()) render();
   try {
-    const data = await invoke("get_account_quota", { id });
+    const data = await invoke("get_account_quota", { id, force });
     acctQuota[id] = { data, err: null, busy: false };
   } catch (e) {
     acctQuota[id] = { data: null, err: stripErr(e), busy: false };
@@ -306,7 +306,7 @@ const actions = {
   },
   acctQuota(id) {
     const dueAt = quotaDue[id];
-    loadAcctQuota(id).then(() => {
+    loadAcctQuota(id, true).then(() => {
       if (quotaDue[id] === dueAt) scheduleNext(id);
     });
   },
@@ -415,7 +415,7 @@ const actions = {
         claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
         if (!uiLocked()) render();
         try {
-          const r = await invoke("claim_refresh", { id });
+          const r = await invoke("claim_refresh", { id, force: true });
           claimable[id] = { plans: r.plans || [], err: null, busy: false };
           await fetchClaimed(id);
           if ((r.plans || []).length) okCount++;
@@ -452,7 +452,7 @@ const actions = {
     claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
     if (!uiLocked()) render();
     try {
-      const r = await invoke("claim_refresh", { id });
+      const r = await invoke("claim_refresh", { id, force: true });
       claimable[id] = { plans: r.plans || [], err: null, busy: false };
       await fetchClaimed(id);
       if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
@@ -812,6 +812,12 @@ function acctQuotaSlot(id) {
         inner = slotRowsHtml(items);
       }
     }
+    // 额度防线：服务器侧余额不含一次性赠送池，全部耗尽但赠送池生效中时提示，防误判白领
+    const exhaustedAll = plans.length > 0 && plans.every((p) => (p.percent_used ?? 100) >= 99.5);
+    const hasActiveBonus = (claimedState[id]?.plans || []).some((p) => !p.status || p.status === "active");
+    if (exhaustedAll && hasActiveBonus) {
+      inner += `<div class="q-bonus-hint">${esc(t("q.bonusActive"))}</div>`;
+    }
   }
   const claimed = claimedStripHtml(id);
   if (!strip && !claimed && !inner) return `<div class="row-quota-slot"></div>`;
@@ -1004,7 +1010,7 @@ listen("claim://result", (ev) => {
     toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
   if (p.accountId) {
-    loadAcctQuota(p.accountId);
+    loadAcctQuota(p.accountId, true);
     if (!autoClaimRunning) {
       loadClaimPreview(p.accountId).then(() => { if (!uiLocked()) render(); });
     }

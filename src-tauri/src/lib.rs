@@ -7,6 +7,7 @@ mod flowlog;
 mod oauth;
 mod probe;
 mod quota;
+mod risk;
 mod store;
 mod zcrypto;
 
@@ -220,8 +221,17 @@ async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
 }
 
 #[tauri::command]
-async fn get_account_quota(id: String) -> Result<quota::QuotaOverview, String> {
-    store::account_quota(&Paths::detect(), &id)
+async fn get_account_quota(id: String, force: Option<bool>) -> Result<quota::QuotaOverview, String> {
+    let paths = Paths::detect();
+    if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
+        let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+        return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+    }
+    let r = store::account_quota(&paths, &id);
+    if let Err(e) = &r {
+        risk::observe_upstream_failure(&paths, &id, e);
+    }
+    r
 }
 
 #[tauri::command]
@@ -230,6 +240,10 @@ async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
     claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })
 }
 
 #[derive(serde::Serialize)]
@@ -244,7 +258,12 @@ async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
-    let plans = claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    let plans =
+        claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+            .map_err(|e| {
+                risk::observe_upstream_failure(&paths, &id, &e);
+                e
+            })?;
     let history = store::claim_history_for(&paths, &id);
     Ok(ClaimCurrentResult { plans, history })
 }
@@ -258,10 +277,14 @@ struct ClaimRefreshResult {
 }
 
 #[tauri::command]
-async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
+async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
+    if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
+        let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+        return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+    }
     let (activated, activation_error) =
         match claim::telemetry_user_id(&paths.home, &acc.credentials) {
             Some(uid) => match claim::report_activation_events(&uid, &mid) {
@@ -270,7 +293,11 @@ async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
             },
             None => (false, None),
         };
-    let plans = claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)?;
+    let plans = claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
     Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
@@ -284,7 +311,15 @@ async fn claim_start(
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
-    let plans = claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid.clone())?;
+    // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
+    if auto.unwrap_or(false) && risk::is_cooling(&paths, &id) {
+        return Err(i18n::tr("err.risk.cooling_auto"));
+    }
+    let plans = claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid.clone())
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
     let plan = plans
         .iter()
         .find(|p| p.plan_id == plan_id)
