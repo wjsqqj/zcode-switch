@@ -1,7 +1,7 @@
 {
   "name": "zcode-switch",
   "private": true,
-  "version": "1.7.1",
+  "version": "1.7.1-Z.EMAIL",
   "type": "module",
   "scripts": {
     "dev": "vite",
