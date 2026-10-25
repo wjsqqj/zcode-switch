@@ -1,6 +1,6 @@
 [package]
 name = "zcode-switch"
-version = "1.7.0-beta.1"
+version = "1.7.1"
 description = "ZCode 账号切换器"
 license = "MIT"
 edition = "2021"
@@ -34,6 +34,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(not(windows))'.dependencies]

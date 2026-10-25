@@ -31,3 +31,9 @@ nul
 .zcode/
 
 __pycache__/
+.gitattributes
+.trellis
+.codebuddy
+.trellis/
+.codebuddy/
+AGENTS.md
