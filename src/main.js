@@ -32,6 +32,74 @@ let claimActive = false;
 let lastAutoRound = null;
 let autoToggleBusy = false;
 
+const REQ_TIMEOUT_MS = 60_000;
+
+// 前端异常落盘：界面冻结时用户看不到 DevTools，问题必须可回传
+function logClientError(msg) {
+  try {
+    invoke("log_client_error", { message: String(msg).slice(0, 2000) }).catch(() => {});
+  } catch { /* 日志失败不影响界面 */ }
+}
+window.addEventListener("error", (ev) => logClientError(`error: ${ev.message} @ ${ev.filename}:${ev.lineno}`));
+window.addEventListener("unhandledrejection", (ev) => logClientError(`rejection: ${stripErr(ev.reason) || ev.reason}`));
+
+// 请求看门狗：上游可能因风控/网络长时间不返回，前端不允许无限 busy
+async function invokeWithTimeout(cmd, args, ms = REQ_TIMEOUT_MS) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      invoke(cmd, args),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(t("m.refreshTimeout"))), ms); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const cooldownLeft = (until) => Math.max(0, Math.ceil(((until || 0) - Date.now()) / 1000));
+
+// 唯一的刷新准入判据：所有入口共用，避免各处各写一遍「忙不忙」并静默 return
+function refreshGate(scope) {
+  if (claimAllRunning) return { ok: false, kind: "running" };
+  if (scope === "global") {
+    if (refreshClaim.running || claimActive) return { ok: false, kind: "running" };
+    const wait = cooldownLeft(refreshClaim.cooldownUntil);
+    return wait > 0 ? { ok: false, kind: "cooldown", waitSec: wait } : { ok: true };
+  }
+  if (refreshClaim.running || claimActive || autoClaimRunning || acctRefreshBusy[scope]) {
+    return { ok: false, kind: "running" };
+  }
+  const wait = cooldownLeft(acctRefreshCooldown[scope]);
+  return wait > 0 ? { ok: false, kind: "cooldown", waitSec: wait } : { ok: true };
+}
+
+function toastGate(g) {
+  if (!g || g.ok) return false;
+  if (g.kind === "cooldown") toast(t("m.refreshCooldownSec", { n: g.waitSec }), "warn");
+  else toast(t("m.refreshBusyRunning"), "warn");
+  return false;
+}
+
+// 独立于 $app 的错误条：render 全挂时仍可见、可关闭
+function clearRenderError() {
+  const el = document.getElementById("err-bar");
+  if (el) { el.style.display = "none"; el.innerHTML = ""; }
+}
+
+function showRenderError(e) {
+  const msg = stripErr(e) || String(e);
+  let el = document.getElementById("err-bar");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "err-bar";
+    document.body.prepend(el);
+  }
+  el.style.display = "";
+  el.innerHTML = `<span>${esc(t("m.renderError"))} · ${esc(msg)}</span>` +
+    `<button class="eb-close" click="actions.dismissErrBar()" aria-label="close">✕</button>`;
+  logClientError(`render: ${msg}`);
+}
+
 const NOTCH_COLORS = ["var(--notch-1)", "var(--notch-2)", "var(--notch-3)", "var(--notch-4)", "var(--notch-5)", "var(--notch-6)"];
 function notchColor(id) {
   let h = 0;
@@ -84,7 +152,7 @@ async function loadAcctQuota(id, force = false) {
   acctQuota[id] = { busy: true };
   if (!uiLocked()) render();
   try {
-    const data = await invoke("get_account_quota", { id, force });
+    const data = await invokeWithTimeout("get_account_quota", { id, force });
     acctQuota[id] = { data, err: null, busy: false };
   } catch (e) {
     acctQuota[id] = { data: null, err: stripErr(e), busy: false };
@@ -97,7 +165,7 @@ async function loadClaimPreview(id) {
   if (cur.busy) return;
   claimable[id] = { plans: cur.plans || [], busy: true };
   try {
-    const plans = await invoke("claim_preview", { id });
+    const plans = await invokeWithTimeout("claim_preview", { id });
     claimable[id] = { plans: plans || [], err: null, busy: false };
   } catch (e) {
     claimable[id] = { plans: cur.plans || [], err: String(e), busy: false };
@@ -117,7 +185,7 @@ function waitForClaimResult(accountId, timeoutMs = 90000) {
 async function awaitClaimPreviewFresh(id) {
   claimable[id] = { ...(claimable[id] || {}), busy: true };
   try {
-    const plans = await invoke("claim_preview", { id });
+    const plans = await invokeWithTimeout("claim_preview", { id });
     claimable[id] = { plans: plans || [], err: null, busy: false };
   } catch (e) {
     claimable[id] = { plans: claimable[id]?.plans || [], err: String(e), busy: false };
@@ -128,7 +196,7 @@ async function awaitClaimPreviewFresh(id) {
 // current 失败静默——可领列表优先展示，不受影响。
 async function fetchClaimed(id) {
   try {
-    const r = await invoke("claim_current", { id });
+    const r = await invokeWithTimeout("claim_current", { id });
     claimedState[id] = { plans: r.plans || [], history: r.history || [], err: null };
   } catch (e) {
     claimedState[id] = {
@@ -157,6 +225,8 @@ function autoPillTitle(s) {
 
 const actions = {
   async refresh() { await refresh(); render(); },
+
+  dismissErrBar() { clearRenderError(); },
 
   async capture() {
     await guard(async () => {
@@ -352,7 +422,8 @@ const actions = {
       .map((a) => a.id)
       .filter((id) => (claimable[id]?.plans || []).length > 0);
     if (!ids.length) { toast(t("m.noClaimableAccounts"), "warn"); return; }
-    if (claimActive || claimAllRunning || refreshClaim.running) return;
+    const g = refreshGate("global");
+    if (!g.ok) { toastGate(g); return; }
     claimAllRunning = true;
     claimActive = true;
     try {
@@ -384,13 +455,10 @@ const actions = {
   async refreshClaim() {
     const ids = (state?.accounts || []).map((a) => a.id);
     if (!ids.length) return;
-    const now = Date.now();
-    if (refreshClaim.running || claimAllRunning || (claimActive && !autoClaimRunning)) return;
-    if (now < refreshClaim.cooldownUntil) {
-      toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - now) / 1000) }), "warn");
-      return;
-    }
-    refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0 };
+    // 自动轮次运行中允许抢跑（下面会先请求终止自动轮），因此这里不把 autoClaimRunning 判为忙
+    const g = refreshGate("global");
+    if (!g.ok) { toastGate(g); return; }
+    refreshClaim = { running: true, done: 0, total: ids.length, cooldownUntil: 0, current: "" };
     startRefreshTicker();
     if (autoClaimRunning) {
       autoAbortRequested = true;
@@ -412,10 +480,11 @@ const actions = {
         const id = ids[i];
         const name = state.accounts.find((a) => a.id === id)?.name || id;
         refreshClaim.done = i + 1;
+        refreshClaim.current = name;
         claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
         if (!uiLocked()) render();
         try {
-          const r = await invoke("claim_refresh", { id, force: true });
+          const r = await invokeWithTimeout("claim_refresh", { id, force: true });
           claimable[id] = { plans: r.plans || [], err: null, busy: false };
           await fetchClaimed(id);
           if ((r.plans || []).length) okCount++;
@@ -439,20 +508,15 @@ const actions = {
 
   async acctRefreshClaim(id) {
     const name = state?.accounts.find((a) => a.id === id)?.name || id;
-    const now = Date.now();
-    if (refreshClaim.running || claimAllRunning || claimActive || autoClaimRunning || acctRefreshBusy[id]) return;
-    const cooldownUntil = acctRefreshCooldown[id] || 0;
-    if (now < cooldownUntil) {
-      toast(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((cooldownUntil - now) / 1000) }), "warn");
-      return;
-    }
+    const g = refreshGate(id);
+    if (!g.ok) { toastGate(g); return; }
     acctRefreshBusy[id] = true;
     acctRefreshCooldown[id] = 0;
     startRefreshTicker();
     claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
     if (!uiLocked()) render();
     try {
-      const r = await invoke("claim_refresh", { id, force: true });
+      const r = await invokeWithTimeout("claim_refresh", { id, force: true });
       claimable[id] = { plans: r.plans || [], err: null, busy: false };
       await fetchClaimed(id);
       if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
@@ -814,7 +878,10 @@ function acctQuotaSlot(id) {
     }
     // 额度防线：服务器侧余额不含一次性赠送池，全部耗尽但赠送池生效中时提示，防误判白领
     const exhaustedAll = plans.length > 0 && plans.every((p) => (p.percent_used ?? 100) >= 99.5);
-    const hasActiveBonus = (claimedState[id]?.plans || []).some((p) => !p.status || p.status === "active");
+    // 「赠送池生效」以权益生效时刻为准：plan.starts_at 只是活动开始，effective_at 才代表额度可用；
+    // 0/缺失视为立即生效（服务端约定）。
+    const hasActiveBonus = (claimedState[id]?.plans || []).some((p) =>
+      (!p.status || p.status === "active") && (p.effective_at == null || p.effective_at <= Date.now()));
     if (exhaustedAll && hasActiveBonus) {
       inner += `<div class="q-bonus-hint">${esc(t("q.bonusActive"))}</div>`;
     }
@@ -849,6 +916,16 @@ function restoreScroll(cap) {
 }
 
 function render() {
+  try {
+    renderInner();
+    clearRenderError();
+  } catch (e) {
+    // 渲染异常绝不允许冻结整页：保留错误条 + 落盘，后续 ticker 重试
+    showRenderError(e);
+  }
+}
+
+function renderInner() {
   const scrollCap = captureScroll();
   if (!state) {
     $app.innerHTML = `<div class="loading">LOADING</div>`;
@@ -857,6 +934,15 @@ function render() {
   const s = state;
   const active = s.accounts.find((a) => a.is_active) || null;
   const unsaved = s.live_logged_in && !active;
+
+  const cdTop = cooldownLeft(refreshClaim.cooldownUntil);
+  const refreshTopOff = refreshClaim.running || claimAllRunning || claimActive || cdTop > 0;
+  const refreshTopLabel = refreshClaim.running
+    ? `${t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total })}${refreshClaim.current ? " · " + refreshClaim.current : ""}`
+    : cdTop > 0 ? `${t("btn.refreshClaim")} (${cdTop}s)` : t("btn.refreshClaim");
+  const refreshTopTitle = cdTop > 0 && !refreshClaim.running
+    ? t("btn.refreshClaimCooldownTitle", { n: cdTop })
+    : t("btn.refreshClaimTitle");
 
   const dotCls = s.zcode_running ? "run" : s.live_logged_in ? "" : "off";
   const statusText = s.zcode_running
@@ -890,6 +976,11 @@ function render() {
         meta += `<span class="${exp.warn ? "warn-line" : ""}">${esc(t("q.validUntil", { date: exp.text }))}</span>`;
     }
     if (ident) meta += `${meta ? " · " : ""}${esc(ident)}`;
+    const rowCd = cooldownLeft(acctRefreshCooldown[a.id]);
+    const rowOff = acctRefreshBusy[a.id] || claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning || rowCd > 0;
+    const rowTitle = rowCd > 0 && !acctRefreshBusy[a.id]
+      ? t("m.refreshCooldownSec", { n: rowCd })
+      : t("btn.acctRefreshTitle");
     return `
     <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
       <div class="row-top">
@@ -899,9 +990,8 @@ function render() {
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
-          <button class="icon-btn" title="${t("btn.acctRefreshTitle")}" aria-label="${t("btn.acctRefreshTitle")}"
-            click="actions.acctRefreshClaim('${a.id}')"
-            ${acctRefreshBusy[a.id] || claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning || Date.now() < (acctRefreshCooldown[a.id] || 0) ? "disabled" : ""}>${ic("refresh", 16)}</button>
+          <button class="icon-btn${rowOff ? " is-off" : ""}" title="${esc(rowTitle)}" aria-label="${esc(rowTitle)}"
+            click="actions.acctRefreshClaim('${a.id}')">${ic("refresh", 16)}${rowCd > 0 && !acctRefreshBusy[a.id] ? `<span class="ic-badge">${rowCd}</span>` : ""}</button>
           <button class="icon-btn" title="${t("btn.quota")}" aria-label="${t("btn.quota")}" click="actions.acctQuota('${a.id}')">${ic("gauge", 16)}</button>
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
@@ -944,15 +1034,8 @@ function render() {
             title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
         : ""}
       ${(s.accounts.length > 0)
-        ? `<button class="btn-ghost has-ic" click="actions.refreshClaim()"
-            ${refreshClaim.running || claimAllRunning || Date.now() < refreshClaim.cooldownUntil ? "disabled" : ""}
-            title="${Date.now() < refreshClaim.cooldownUntil && !refreshClaim.running
-              ? esc(t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) }))
-              : esc(t("btn.refreshClaimTitle"))}">
-            ${ic("refresh", 16)} ${refreshClaim.running
-              ? esc(t("btn.refreshClaimRunning", { done: refreshClaim.done, total: refreshClaim.total }))
-              : esc(t("btn.refreshClaim"))}
-          </button>`
+        ? `<button class="btn-ghost has-ic${refreshTopOff ? " is-off" : ""}" click="actions.refreshClaim()"
+            title="${esc(refreshTopTitle)}">${ic("refresh", 16)} ${esc(refreshTopLabel)}</button>`
         : ""}
       <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"

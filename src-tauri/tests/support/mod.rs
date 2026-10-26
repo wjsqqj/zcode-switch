@@ -4,10 +4,21 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// 一条被 mock 收到的请求：用于「请求规格」断言（header 是否成套、body 是否只含 plan_id、
+/// 有没有把凭证塞进 body 等）。仅测试使用。
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    pub path: String,
+    /// 键统一小写，便于大小写无关断言
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
 
 pub struct Route {
     pub path: &'static str,
@@ -42,6 +53,7 @@ impl Route {
 pub struct MockUpstream {
     pub base: String,
     counters: Arc<Vec<AtomicUsize>>,
+    recorder: Arc<Mutex<Vec<Recorded>>>,
     _shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -56,6 +68,8 @@ impl MockUpstream {
         let routes = Arc::new(routes);
         let serve_routes = routes.clone();
         let serve_counters = counters.clone();
+        let recorder: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
+        let serve_recorder = recorder.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
         let handle = std::thread::spawn(move || {
@@ -74,7 +88,10 @@ impl MockUpstream {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let _ = stream.set_nonblocking(false);
                 let req = read_request(&mut stream);
-                let Some(path) = req else { continue };
+                let Some((path, headers, body)) = req else { continue };
+                if let Ok(mut v) = serve_recorder.lock() {
+                    v.push(Recorded { path: path.clone(), headers, body });
+                }
                 // 找第一条前缀匹配路由
                 let idx = serve_routes.iter().position(|r| path.starts_with(r.path));
                 let resp = match idx {
@@ -95,6 +112,7 @@ impl MockUpstream {
         MockUpstream {
             base: format!("http://127.0.0.1:{port}"),
             counters,
+            recorder,
             _shutdown: shutdown,
             handle: Some(handle),
         }
@@ -103,6 +121,11 @@ impl MockUpstream {
     /// 某路由已被请求的次数（TTL 断言用）
     pub fn hits(&self, route_idx: usize) -> usize {
         self.counters[route_idx].load(Ordering::SeqCst)
+    }
+
+    /// 已收到的全部请求（用于断言请求头/请求体规格、以及「只读命令不产生写请求」）
+    pub fn requests(&self) -> Vec<Recorded> {
+        self.recorder.lock().map(|v| v.clone()).unwrap_or_default()
     }
 }
 
@@ -115,7 +138,7 @@ impl Drop for MockUpstream {
     }
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, BTreeMap<String, String>, String)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     // 读到 header 结束
@@ -131,32 +154,36 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
             Err(_) => return None,
         }
     }
-    let head = String::from_utf8_lossy(&buf).to_string();
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let request_line = head.lines().next()?.to_string();
     let path = request_line.split_whitespace().nth(1)?.to_string();
-    // POST：按 Content-Length 排干 body，避免残留影响下一连接
-    let content_length = head
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    if content_length > 0 {
-        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(buf.len());
-        let already = buf.len().saturating_sub(header_end);
-        let mut remaining = content_length.saturating_sub(already);
-        let mut sink = vec![0u8; 4096];
-        while remaining > 0 {
-            match stream.read(&mut sink) {
-                Ok(0) => break,
-                Ok(n) => remaining = remaining.saturating_sub(n),
-                Err(_) => break,
-            }
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    for line in head.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    // 去掉 query
-    Some(path.split('?').next().unwrap_or(&path).to_string())
+    // POST：按 Content-Length 收齐 body（同时保留下来供测试断言）
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = buf[header_end.min(buf.len())..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    body.truncate(content_length);
+    Some((
+        // 去掉 query
+        path.split('?').next().unwrap_or(&path).to_string(),
+        headers,
+        String::from_utf8_lossy(&body).to_string(),
+    ))
 }
 
 fn format_response(status: u16, headers: &[(&'static str, &'static str)], body: &str) -> String {

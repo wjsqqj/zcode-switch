@@ -106,6 +106,9 @@ pub(crate) fn observe_upstream_failure(paths: &Paths, account_id: &str, message:
 mod tests {
     use super::*;
 
+    /// Paths::detect() 依赖进程级环境变量，并行跑会互相覆盖 home → 必须串行
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_paths(tag: &str) -> (tempdir::TempDir, Paths) {
         let dir = tempdir::TempDir::with_tag(tag);
         let home = dir.path().to_path_buf();
@@ -142,6 +145,7 @@ mod tests {
 
     #[test]
     fn strike_backoff_escalates_and_decays() {
+        let _s = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_d, paths) = temp_paths("escalate");
         let acct = "a1";
         assert!(!is_cooling(&paths, acct));
@@ -160,6 +164,7 @@ mod tests {
 
     #[test]
     fn observe_filters_non_risk_messages() {
+        let _s = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_d, paths) = temp_paths("filter");
         observe_upstream_failure(&paths, "a2", "HTTP 500: internal error");
         assert!(!is_cooling(&paths, "a2"));
@@ -168,7 +173,26 @@ mod tests {
     }
 
     #[test]
+    fn observe_hits_3012_blocked_payload() {
+        let _s = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_d, paths) = temp_paths("blocked3012");
+        // 用户现场报文（2026-10-26）：provider_code=3012 + status=405 + unusual activity
+        let msg = "request has been blocked due to unusual activity. TraceID: ae8356b0-5a\n\
+                   Turn execution failed provider=account:zai-start-plan provider_code=3012 \
+                   model=GLM-5.3-Flash request=e83ac2c4-371 reason=unknown status=405 retryable=false";
+        observe_upstream_failure(&paths, "acct-3012", msg);
+        assert!(is_cooling(&paths, "acct-3012"), "3012 / unusual activity 必须记 strike");
+        let secs = cooling_remaining_secs(&paths, "acct-3012");
+        assert!(secs > 800 && secs <= 900, "首次命中退避 ~900s，实际 {secs}");
+        // 冷却期内重复命中要按指数退避叠加
+        observe_upstream_failure(&paths, "acct-3012", "provider_code=3012");
+        let secs2 = cooling_remaining_secs(&paths, "acct-3012");
+        assert!(secs2 > 1600, "第二次命中应退避到 ~1800s，实际 {secs2}");
+    }
+
+    #[test]
     fn cooling_expires_and_window_decays() {
+        let _s = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (_d, paths) = temp_paths("decay");
         let acct = "a3";
         record_strike(&paths, acct);

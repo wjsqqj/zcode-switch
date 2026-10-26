@@ -355,6 +355,70 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
     Ok(out)
 }
 
+/// 诊断用：原样返回上游 JSON（不解析、不降级）。用于排查「某账号为什么看不到活动 /
+/// 生效时间到底取哪个字段」。任何非 2xx 都以错误返回，便于看清 HTTP 码。
+fn fetch_raw_json(url: &str, token: &str, mid: Option<String>, prefix: &str) -> Result<Value, String> {
+    let mut req = agent().get(url);
+    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = req
+        .call()
+        .map_err(|e| http_err(prefix, e))?
+        .into_string()
+        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
+    Ok(serde_json::from_str(&resp).unwrap_or(Value::String(resp)))
+}
+
+fn raw_token(home: &Path, creds: &Value, config: Option<&Value>) -> Result<String, String> {
+    claim_token(creds, config, &zcrypto::default_secret(home))
+}
+
+/// 原始 `billing/preview` 响应。
+pub fn raw_preview(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<Value, String> {
+    let token = raw_token(home, creds, config)?;
+    let url = format!(
+        "{}?app_version={}&platform={}",
+        billing_preview_url(),
+        quota::zcode_app_version(),
+        quota::client_platform()
+    );
+    fetch_raw_json(&url, &token, device_mid, "preview")
+}
+
+/// 原始 `marketing/touch` 响应（活动下发通道）。
+pub fn raw_marketing(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<Value, String> {
+    let token = raw_token(home, creds, config)?;
+    fetch_raw_json(&marketing_touch_url(), &token, device_mid, "marketing")
+}
+
+/// 原始 `billing/current` 响应（已生效/待生效套餐，含 starts_at / status）。
+pub fn raw_current(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<Value, String> {
+    let token = raw_token(home, creds, config)?;
+    let url = format!(
+        "{}?app_version={}&platform={}",
+        billing_current_url(),
+        quota::zcode_app_version(),
+        quota::client_platform()
+    );
+    fetch_raw_json(&url, &token, device_mid, "current")
+}
+
 /// 营销触达通道：新版活动（客户端弹窗/banner）只经 marketing/touch 下发，billing/preview 不返回。
 /// deliveries 的按钮带可领 plan_id（action.type = claim_zcode_plan），payload 在 background/hero 的
 /// args.zcode_plan 内嵌完整套餐结构（字段与 preview plans 同构）。任何失败静默降级为空列表并记本地
@@ -480,6 +544,9 @@ pub struct ActivePlan {
     pub status: String,
     pub starts_at: Option<i64>,
     pub ends_at: Option<i64>,
+    /// 真实生效时间（ms）：取 `entitlements[].effective_at` 的最小值（秒×1000）。
+    /// `plan.starts_at` 只是活动/计划开始，不等于权益生效；0 表示立即生效。
+    pub effective_at: Option<i64>,
     pub grant_items: Vec<ClaimGrant>,
 }
 
@@ -531,6 +598,16 @@ pub fn fetch_active_plans(
                 status: str_field(p, "status", "status").unwrap_or("").to_string(),
                 starts_at: p.get("starts_at").and_then(|x| x.as_i64()).map(|s| s * 1000),
                 ends_at: p.get("ends_at").and_then(|x| x.as_i64()).map(|s| s * 1000),
+                // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），plan.starts_at 不是它
+                effective_at: p
+                    .get("entitlements")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .filter_map(|it| it.get("effective_at").and_then(|x| x.as_i64()))
+                            .min()
+                    })
+                    .map(|s| s * 1000),
                 grant_items,
             })
         })

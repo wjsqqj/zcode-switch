@@ -76,6 +76,24 @@ fn marketing_extracts_payloads_buttons_and_minimal_entries() {
     assert!(minimal.grant_items.is_empty());
 }
 
+/// 用户现场报文（2026-10-26）：405 + provider_code=3012 + unusual activity。
+/// 期望：错误上抛（含 405 与 unusual activity 文本），供 risk::observe_upstream_failure 记 strike。
+#[test]
+fn preview_blocked_unusual_activity_3012_surfaces_error() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/zcode-plan/billing/preview",
+        vec![(405, r#"{"provider_code":3012,"reason":"unknown","status":405,"retryable":false,"message":"request has been blocked due to unusual activity. TraceID: ae8356b0-5a"}"#)],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("m3012");
+    let err = claim::preview_plans(home.path(), &creds, None, None).unwrap_err();
+    del_env("ZCODE_API_BASE");
+    let lower = err.to_lowercase();
+    assert!(err.contains("405"), "风控 HTTP 码必须保留，实际：{err}");
+    assert!(lower.contains("unusual activity"), "风控文案必须保留供 strike 判定，实际：{err}");
+}
+
 #[test]
 fn marketing_empty_deliveries_and_error_silent() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -158,6 +176,95 @@ fn claim_error_matrix_3007_terminal_challenge_success() {
     let ok = claim::submit_claim(home.path(), &creds, None, "p1", "cap", None, None).unwrap();
     del_env("ZCODE_API_BASE");
     assert_eq!(ok.pointer("/data/plan/status"), Some(&json!("active")));
+}
+
+/// 请求规格断言：`billing/preview` 必须带成套身份头（缺任一条上游会误判成风控/无资格），
+/// 且 GET 不得携带 body（防凭证外泄）。
+#[test]
+fn preview_requests_carry_identity_headers() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/zcode-plan/billing/preview",
+        vec![(200, r#"{"code":0,"data":{"server_time":1,"plans":[]}}"#)],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mhdr");
+    let _ = claim::preview_plans(
+        home.path(),
+        &creds,
+        None,
+        Some("11111111-2222-3333-4444-555555555555".into()),
+    )
+    .unwrap();
+    del_env("ZCODE_API_BASE");
+
+    let req = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.path.contains("/billing/preview"))
+        .expect("preview 请求未到达 mock");
+    let required = [
+        "authorization",
+        "x-device-mid",
+        "x-zcode-app-version",
+        "x-platform",
+        "x-os-category",
+        "x-client-language",
+        "x-client-timezone",
+        "x-title",
+        "user-agent",
+    ];
+    for k in required {
+        assert!(
+            req.headers.contains_key(k),
+            "缺少请求头 {k}，实际携带：{:?}",
+            req.headers.keys().collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        !req.headers.get("x-zcode-app-version").unwrap().is_empty(),
+        "X-ZCode-App-Version 不能为空（版本门槛会过滤活动）"
+    );
+    assert!(req.body.is_empty(), "GET 请求不应有 body，实际：{}", req.body);
+}
+
+/// 请求规格断言：领取 POST 的 body 只允许 `plan_id`，验证码走 header（参数与地区成套）。
+#[test]
+fn claim_post_sends_plan_id_and_captcha_headers() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::with_headers(
+        "/api/v1/zcode-plan/billing/claim",
+        vec![(
+            200,
+            Vec::new(),
+            r#"{"code":0,"data":{"plan":{"user_plan_id":"u1","plan_id":"p1","status":"active","starts_at":1,"ends_at":2},"server_time":3}}"#,
+        )],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mbody");
+    claim::submit_claim(home.path(), &creds, None, "p1", "cap-x", Some("cn"), None).unwrap();
+    del_env("ZCODE_API_BASE");
+
+    let req = mock
+        .requests()
+        .into_iter()
+        .find(|r| r.path.contains("/billing/claim"))
+        .expect("claim 请求未到达 mock");
+    assert_eq!(
+        req.headers.get("x-aliyun-captcha-verify-param").map(String::as_str),
+        Some("cap-x"),
+        "验证码参数必须走 header"
+    );
+    assert_eq!(
+        req.headers.get("x-aliyun-captcha-verify-region").map(String::as_str),
+        Some("cn"),
+        "验证码地区必须成套发送（缺失会导致 3007）"
+    );
+    let body: serde_json::Value = serde_json::from_str(&req.body).expect("claim body 必须是 JSON");
+    let obj = body.as_object().expect("claim body 必须是对象");
+    assert_eq!(obj.len(), 1, "body 只允许 plan_id，实际：{}", req.body);
+    assert_eq!(obj.get("plan_id").and_then(|v| v.as_str()), Some("p1"));
+    assert!(!req.body.contains("Bearer"), "凭证不得进入 body");
 }
 
 #[test]

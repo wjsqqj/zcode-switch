@@ -33,15 +33,6 @@ struct PendingClaim {
     credentials: Value,
     config: Option<Value>,
     device_mid: String,
-    /// 验证码提交次数（1 起）。3007 允许换新参数重试一次（共 2 次）。
-    captcha_attempt: u8,
-}
-
-impl PendingClaim {
-    fn with_attempt(mut self, n: u8) -> Self {
-        self.captcha_attempt = n;
-        self
-    }
 }
 
 static PENDING_CLAIM: Mutex<Option<PendingClaim>> = Mutex::new(None);
@@ -58,6 +49,22 @@ fn store_guard() -> std::sync::MutexGuard<'static, ()> {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// 在阻塞线程池里跑必须同步等待的工作（ureq 网络请求、进程操作等）。
+///
+/// 纪律：`async` 命令里**禁止**直接执行阻塞 I/O。Tauri 的 async 命令跑在异步运行时的
+/// worker 线程上，一次 `claim_refresh` 最长阻塞 2×10s（激活事件）+ 25s（preview）+
+/// 25s（marketing）；并发点几个账号就会把所有 worker 占满，`get_state` / `set_behavior`
+/// 等命令全部排队 → 界面整体卡死、额度区永远「查询中…」。
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| i18n::trf("err.internal", &[("e", &e.to_string())]))?
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -217,33 +224,44 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
 
 #[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
-    store::live_quota(&Paths::detect())
+    run_blocking(|| store::live_quota(&Paths::detect())).await
 }
 
 #[tauri::command]
 async fn get_account_quota(id: String, force: Option<bool>) -> Result<quota::QuotaOverview, String> {
-    let paths = Paths::detect();
-    if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
-        let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
-        return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
-    }
-    let r = store::account_quota(&paths, &id);
-    if let Err(e) = &r {
-        risk::observe_upstream_failure(&paths, &id, e);
-    }
-    r
+    run_blocking(move || {
+        let paths = Paths::detect();
+        if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
+            let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+            return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+        }
+        let r = store::account_quota(&paths, &id);
+        if let Err(e) = &r {
+            risk::observe_upstream_failure(&paths, &id, e);
+        }
+        r
+    })
+    .await
 }
 
 #[tauri::command]
 async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
-    let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
-        .map_err(|e| {
-            risk::observe_upstream_failure(&paths, &id, &e);
-            e
-        })
+    run_blocking(move || {
+        let paths = Paths::detect();
+        // 冷却期零上游流量：preview 也是 billing 请求，必须一起挡住
+        if risk::is_cooling(&paths, &id) {
+            let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+            return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+        }
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+            .map_err(|e| {
+                risk::observe_upstream_failure(&paths, &id, &e);
+                e
+            })
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -255,17 +273,27 @@ struct ClaimCurrentResult {
 
 #[tauri::command]
 async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
-    let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    let plans =
-        claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
-            .map_err(|e| {
-                risk::observe_upstream_failure(&paths, &id, &e);
-                e
-            })?;
-    let history = store::claim_history_for(&paths, &id);
-    Ok(ClaimCurrentResult { plans, history })
+    run_blocking(move || {
+        let paths = Paths::detect();
+        // 冷却期零上游流量：current 只回本地历史，不发上游请求（避免冷却被反复刷新击穿）
+        if risk::is_cooling(&paths, &id) {
+            return Ok(ClaimCurrentResult {
+                plans: Vec::new(),
+                history: store::claim_history_for(&paths, &id),
+            });
+        }
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        let plans =
+            claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+                .map_err(|e| {
+                    risk::observe_upstream_failure(&paths, &id, &e);
+                    e
+                })?;
+        let history = store::claim_history_for(&paths, &id);
+        Ok(ClaimCurrentResult { plans, history })
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -278,27 +306,31 @@ struct ClaimRefreshResult {
 
 #[tauri::command]
 async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
-    let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
-        let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
-        return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
-    }
-    let (activated, activation_error) =
-        match claim::telemetry_user_id(&paths.home, &acc.credentials) {
-            Some(uid) => match claim::report_activation_events(&uid, &mid) {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e)),
-            },
-            None => (false, None),
-        };
-    let plans = claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
-        .map_err(|e| {
-            risk::observe_upstream_failure(&paths, &id, &e);
-            e
-        })?;
-    Ok(ClaimRefreshResult { plans, activated, activation_error })
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
+            let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
+            return Err(i18n::trf("err.risk.cooling", &[("mins", &mins.to_string())]));
+        }
+        let (activated, activation_error) =
+            match claim::telemetry_user_id(&paths.home, &acc.credentials) {
+                Some(uid) => match claim::report_activation_events(&uid, &mid) {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e)),
+                },
+                None => (false, None),
+            };
+        let plans =
+            claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+                .map_err(|e| {
+                    risk::observe_upstream_failure(&paths, &id, &e);
+                    e
+                })?;
+        Ok(ClaimRefreshResult { plans, activated, activation_error })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -308,41 +340,49 @@ async fn claim_start(
     plan_id: String,
     auto: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let paths = Paths::detect();
-    let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-    let acc = load_account(&paths, &id)?;
-    // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
-    if auto.unwrap_or(false) && risk::is_cooling(&paths, &id) {
-        return Err(i18n::tr("err.risk.cooling_auto"));
-    }
-    let plans = claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid.clone())
+    let app2 = app.clone();
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
+        let acc = load_account(&paths, &id)?;
+        // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
+        if auto.unwrap_or(false) && risk::is_cooling(&paths, &id) {
+            return Err(i18n::tr("err.risk.cooling_auto"));
+        }
+        let plans = claim::collect_claimable_plans(
+            &paths.home,
+            &acc.credentials,
+            acc.config.as_ref(),
+            mid.clone(),
+        )
         .map_err(|e| {
             risk::observe_upstream_failure(&paths, &id, &e);
             e
         })?;
-    let plan = plans
-        .iter()
-        .find(|p| p.plan_id == plan_id)
-        .ok_or_else(|| i18n::tr("err.claim.gone"))?;
-    let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
+        let plan = plans
+            .iter()
+            .find(|p| p.plan_id == plan_id)
+            .ok_or_else(|| i18n::tr("err.claim.gone"))?;
+        let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
 
-    *pending_guard() = Some(PendingClaim {
-        account_id: acc.id.clone(),
-        account_name: acc.name.clone(),
-        plan_id: plan.plan_id.clone(),
-        plan_name: display.clone(),
-        credentials: acc.credentials,
-        config: acc.config,
-        device_mid: mid,
-        captcha_attempt: 1,
-    });
-    open_captcha_window(&app, auto.unwrap_or(false))?;
-    Ok(json!({ "account": acc.name, "plan": display }))
+        *pending_guard() = Some(PendingClaim {
+            account_id: acc.id.clone(),
+            account_name: acc.name.clone(),
+            plan_id: plan.plan_id.clone(),
+            plan_name: display.clone(),
+            credentials: acc.credentials,
+            config: acc.config,
+            device_mid: mid,
+        });
+        open_captcha_window(&app2, auto.unwrap_or(false))?;
+        Ok(json!({ "account": acc.name, "plan": display }))
+    })
+    .await
 }
 
 #[tauri::command]
 async fn claim_captcha_config() -> Result<claim::CaptchaConfig, String> {
-    claim::fetch_captcha_config()
+    run_blocking(claim::fetch_captcha_config).await
 }
 
 #[tauri::command]
@@ -351,63 +391,76 @@ async fn claim_captcha_submit(
     param: String,
     region: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
-    let paths = Paths::detect();
-    let res = claim::submit_claim(
-        &paths.home,
-        &pending.credentials,
-        pending.config.as_ref(),
-        &pending.plan_id,
-        &param,
-        region.as_deref(),
-        Some(pending.device_mid.clone()),
-    );
-    // 3007：验证码校验失败（参数过期/已用）。第一次时把 pending 放回、不关窗口、
-    // 不发终态事件，让验证码窗口拿新参数自动重试一次（plan-claim 纪律：仅重试一次）。
-    if let Err(e) = &res {
-        if e.is_captcha_rejected() && pending.captcha_attempt == 1 {
-            *pending_guard() = Some(pending.clone().with_attempt(2));
-            return Ok(json!({ "retry": true, "code": e.code, "message": e.message }));
+    let app2 = app.clone();
+    run_blocking(move || {
+        let pending = pending_guard().take().ok_or_else(|| i18n::tr("err.claim.none_pending"))?;
+        let paths = Paths::detect();
+        let res = claim::submit_claim(
+            &paths.home,
+            &pending.credentials,
+            pending.config.as_ref(),
+            &pending.plan_id,
+            &param,
+            region.as_deref(),
+            Some(pending.device_mid.clone()),
+        );
+        // 3007（验证码被拒/参数过期）：**不再换码自动重试**。
+        // 参考实测结论（zcode2api 2.6.5 整改）：拒码本身就是上游风险信号，换码连打只会加剧，
+        // 且会白耗一次唯一重试额度。这里直接走终态失败，让用户重新发起领取（重新取验证码）。
+        if let Err(e) = &res {
+            if e.is_captcha_rejected() {
+                flowlog::log(
+                    "claim",
+                    "captcha-rejected-3007",
+                    &format!("code={} 不自动重试", e.code),
+                );
+            }
         }
-    }
-    close_captcha_window(&app);
-    let payload = match res {
-        Ok(v) => {
-            let ms = |k: &str| -> Option<i64> {
-                v.pointer(&format!("/data/plan/{k}"))
+        close_captcha_window(&app2);
+        let payload = match res {
+            Ok(v) => {
+                let ms = |k: &str| -> Option<i64> {
+                    v.pointer(&format!("/data/plan/{k}"))
+                        .and_then(|x| x.as_i64())
+                        .map(|s| s * 1000)
+                };
+                let server_time = v
+                    .pointer("/data/server_time")
                     .and_then(|x| x.as_i64())
-                    .map(|s| s * 1000)
-            };
-            let server_time = v
-                .pointer("/data/server_time")
-                .and_then(|x| x.as_i64())
-                .map(|s| s * 1000);
-            let outcome = claim::ClaimOutcome {
-                account_id: pending.account_id.clone(),
-                account_name: pending.account_name.clone(),
-                plan_name: pending.plan_name.clone(),
-                starts_at: ms("starts_at"),
-                ends_at: ms("ends_at"),
-                server_time,
-            };
-            let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
-            // 领取成功落历史（best-effort），供「已领取生效中」展示
-            store::record_claim_history(&paths, &pending.account_id, &pending.plan_id, &pending.plan_name);
-            let _ = app.emit("claim://result", &p);
-            p
-        }
-        Err(e) => {
-            let p = claim::failure_payload(
-                &pending.account_id,
-                &pending.account_name,
-                &pending.plan_name,
-                &e,
-            );
-            let _ = app.emit("claim://result", &p);
-            return Ok(p);
-        }
-    };
-    Ok(payload)
+                    .map(|s| s * 1000);
+                let outcome = claim::ClaimOutcome {
+                    account_id: pending.account_id.clone(),
+                    account_name: pending.account_name.clone(),
+                    plan_name: pending.plan_name.clone(),
+                    starts_at: ms("starts_at"),
+                    ends_at: ms("ends_at"),
+                    server_time,
+                };
+                let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+                // 领取成功落历史（best-effort），供「已领取生效中」展示
+                store::record_claim_history(
+                    &paths,
+                    &pending.account_id,
+                    &pending.plan_id,
+                    &pending.plan_name,
+                );
+                let _ = app2.emit("claim://result", &p);
+                p
+            }
+            Err(e) => {
+                let p = claim::failure_payload(
+                    &pending.account_id,
+                    &pending.account_name,
+                    &pending.plan_name,
+                    &e,
+                );
+                let _ = app2.emit("claim://result", &p);
+                return Ok(p);
+            }
+        };
+        Ok(payload)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -415,6 +468,30 @@ async fn claim_cancel(app: AppHandle) -> Result<(), String> {
     *pending_guard() = None;
     close_captcha_window(&app);
     Ok(())
+}
+
+/// 前端异常落盘：`{home}/.zcode-switch/client-error.log`，最多保留 200 行。
+/// 目的是让「界面冻结/报错」这类只能靠 DevTools 看到的问题可回传、可定位。
+#[tauri::command]
+async fn log_client_error(message: String) -> Result<(), String> {
+    run_blocking(move || {
+        let dir = Paths::detect().store_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = dir.join("client-error.log");
+        let mut lines: Vec<String> = std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        lines.push(format!("[{ts}] {}", message.replace('\n', " ⏎ ")));
+        if lines.len() > 200 {
+            let excess = lines.len() - 200;
+            lines.drain(0..excess);
+        }
+        std::fs::write(&file, lines.join("\n") + "\n").map_err(|e| e.to_string())
+    })
+    .await
 }
 
 fn close_captcha_window(app: &AppHandle) {
@@ -1365,6 +1442,7 @@ pub fn run() {
             claim_captcha_config,
             claim_captcha_submit,
             claim_cancel,
+            log_client_error,
             oauth_providers,
             oauth_begin,
             set_auth_proxy,

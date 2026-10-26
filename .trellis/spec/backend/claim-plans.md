@@ -107,7 +107,7 @@ impl ClaimError {
 ```
 
 - HTTP 401/403 携带 `x-aliyun-captcha-verify-param` 头或 body 含 captcha 字样 → `-2` 挑战（zcode2api 教训：当登录过期处理会错杀健康账号）。`failure_payload` 结构化输出 `terminal`/`challenge`，前端不得用 code 区间反推。
-- 3007 窗口内重试一次：`claim_captcha_submit` 首次 3007 放回 pending（`captcha_attempt=2`）返回 `{retry:true}`，captcha.js 销毁重建实例换新参数；第二次 3007 走终态。验证码参数一次性，复用必 3007。
+- 3007 **不自动重试**（2026-10-26 变更，吸收 zcode2api 2.6.5 整改结论）：拒码本身是上游风险信号，换码连打只会加剧。`claim_captcha_submit` 收到 3007 直接走终态失败并记 `flowlog` `captcha-rejected-3007`，由用户重新发起领取（重新取参数）。`captcha_attempt` 字段与 `{retry:true}` 协议已移除。
 - 前端自动轮 (账号,套餐) 级 `claimHold`：终态 Infinity、1005 至 nextAt（无则 1h）、挑战 10min。
 
 ### 验证码配置
@@ -124,6 +124,8 @@ impl ClaimError {
 ## 10. 已领取状态（2026-10-24 补充，任务 10-24-claimed-state）
 
 - `fetch_active_plans` → `GET billing/current`（`data.plans[{user_plan_id,plan_id,name,status,starts_at,ends_at,entitlements}]`，秒级时间戳×1000 转 ms）。
+- **时间语义（2026-10-26 实测补充）**：`plan.starts_at` 是活动/计划开始时间，**不是生效时间**；真正生效时间在 `entitlements[].effective_at`（样例：`ZCODE GLOBAL BUILD` 的 `starts_at=19:15:53`、`entitlements[0].effective_at=23:00:00`、`ends_at=次日 09:00`）。任何「生效时间」展示必须优先 `effective_at`，其次 `starts_at`，都没有标「未提供」。
+- **诊断命令**：`--cli claim-current --id` 查已生效套餐 + 本地历史；`--cli claim-raw --id [--only preview|marketing|current]` 原样打印上游 JSON（排查「为什么这个账号看不到活动」）。实测：服务端对无资格账号两通道均返回 `code=0` 且数组为空，**不提供原因字段**，本地不得据此编造原因。
 - 领取成功落 `claim-history.json`（200 条滚动，仅元数据）；`claim_current(id)` 命令返回 `{plans, history}`；current 失败前端静默。
 - preview 为空 ≠ 无活动（可能已领取）——用 current + 历史区分。
 
@@ -135,4 +137,79 @@ impl ClaimError {
 
 ---
 
-**历史**: 2026-10-24 新增（marketing/touch 接入）。同日补充 §8-§11（吸收 zcode-proxy/zcode2api/zcode-plan-claim 经验的五任务批次）。根因排查与协议还原记录见 `.trellis/tasks/archive/`。
+**历史**: 2026-10-24 新增（marketing/touch 接入）。同日补充 §8-§11（吸收 zcode-proxy/zcode2api/zcode-plan-claim 经验的五任务批次）。2026-10-26 补充 §12（刷新状态机与阻塞 I/O 纪律）、§13（请求头坑位表与冷却门禁）。根因排查与协议还原记录见 `.trellis/tasks/archive/`。
+
+---
+
+## 13. 请求头坑位表与冷却门禁（2026-10-26 补充，吸收 zcode2api / zcode-plan-claim）
+
+### 13.1 请求头 → 错误码对照（排障查表，别再猜）
+
+| 症状 | 最可能缺失/错误的头 | 说明 |
+|---|---|---|
+| 3007 验证码失败 | `X-Aliyun-Captcha-Verify-Region` 缺失/与参数不同源 | 参数与地区必须成套；参数还要求「原样 JSON 字符串」，被二次序列化同样报 3007 |
+| 3001 参数错误 | `X-Platform=win32` 之类平台值与客户端不一致 | `billing/preview` 容错、`client/configs` 直接拒 |
+| preview 恒空 / 无活动 | `X-ZCode-App-Version` 落后 | 版本门槛会过滤活动；必须取 `max(本机探测, 最新已知)` |
+| 401 空体 | 用了 oauth access_token 而非 `zcodejwttoken` | 领取链路只认 `zcodejwttoken` |
+| 3012 / unusual activity | 出口 IP 与验证码求解不一致、请求过于规律 | 见 §9 退避；求解与 claim 必须同出口 |
+| 幂等异常 | `X-Device-Mid` 每次变化 | 每账号必须稳定复用同一 mid |
+
+必须成套发送（`preview_requests_carry_identity_headers` 用例锁定）：`Authorization`、`X-Device-Mid`、`X-ZCode-App-Version`、`X-Platform`、`X-Os-Category`、`X-Client-Language`、`X-Client-Timezone`、`X-Title`、`User-Agent`。
+
+### 13.2 冷却期零上游流量（所有 billing 入口）
+
+`risk::is_cooling` 必须在**每一个** billing 入口前判断，当前覆盖面：
+
+| 命令 | 冷却期行为 |
+|---|---|
+| `get_account_quota` | 非 `force` 直接返回 `err.risk.cooling` |
+| `claim_refresh` | 非 `force` 直接返回 `err.risk.cooling` |
+| `claim_preview` | 直接返回 `err.risk.cooling`（2026-10-26 补齐） |
+| `claim_current` | **不发上游**，只返回本地 `claim_history_for`（2026-10-26 补齐；避免刷新击穿冷却） |
+| `claim_start` | 仅 `auto=true` 时拦；手动领取是显式意图，放行 |
+
+新增任何 billing 命令时，先对照此表决定冷却期行为，不得遗漏。
+
+### 13.3 测试侧请求规格断言
+
+`tests/support` 的 mock 会记录每条请求的 `path/headers/body`（`MockUpstream::requests()`），用例应同时断言：
+
+- 响应解析正确（业务语义）；
+- **请求规格正确**：头成套、body 仅含允许字段（领取只有 `plan_id`）、GET 无 body；
+- 安全不变量：凭证不出现在 body、只读命令不产生写请求。
+
+
+---
+
+## 12. 刷新状态机与阻塞 I/O 纪律（2026-10-26 补充，任务 10-26-claim-refresh-state-fix）
+
+### 12.1 async 命令禁止直接跑阻塞 I/O
+
+`claim_preview` / `claim_refresh` / `claim_current` / `claim_start` / `claim_captcha_config` / `claim_captcha_submit` / `get_account_quota` / `get_live_quota` 一律经 `lib::run_blocking(...)`（内部 `tauri::async_runtime::spawn_blocking`）执行。
+
+**原因（实测）**：一次 `claim_refresh` 最长阻塞 2×10s（activation 事件）+ 25s（preview）+ 25s（marketing/touch）。直接在 async 命令里跑 `ureq` 会占满异步运行时 worker；用户连点 3 个账号后，`get_state` / `set_behavior` / `claim_cancel` 全部排队 → 整窗卡死、额度区永远「查询中…」。
+
+新增任何网络/进程类命令时遵循同一纪律；`switch_to`、`kill_zcode` 因持有 `STORE_LOCK`（`MutexGuard` 非 `Send`）暂未包装，改动时须把 `store_guard()` 一并移入闭包。
+
+### 12.2 前端刷新准入与反馈契约
+
+- 唯一判据 `refreshGate(scope)`（`scope = "global" | accountId`），返回 `{ok}` 或 `{ok:false, kind:"running"|"cooldown", waitSec}`；`toastGate()` 负责把失败原因变成 toast。
+- **禁止用 `disabled` 表达「忙/冷却」**：`disabled` 会吞掉 click，用户得不到任何提示（本次 bug 的直接成因）。改用 `is-off` class + 可点击，点击后由 gate 说明原因。
+- 冷却必须可见：行内按钮角标显示剩余秒数，顶部按钮显示 `刷新 (Ns)`；`refreshTicker` 每秒重绘保证倒计时递减。
+- 全局刷新显示 `done/total · 当前账号名`，账号间 5s 间隔期间不再出现「无任何更新」。
+- 所有 `claim_*` / `get_account_quota` 前端调用走 `invokeWithTimeout`（60s 看门狗），超时清 `busy` 并提示，杜绝永久 busy。
+
+### 12.3 render 异常兜底
+
+`render()` 只做 try/catch，实际渲染在 `renderInner()`；异常时：
+- 不清空页面，展示挂在 `body` 上的 `#err-bar`（可关闭），保证按钮仍可点；
+- 调用 `log_client_error` 写 `{home}/.zcode-switch/client-error.log`（滚动 200 行）；
+- `window.onerror` / `unhandledrejection` 同样落盘。
+
+排障路径：用户反馈「界面卡住」→ 先读 `client-error.log`，不要再靠猜。
+
+### 12.4 风控矩阵（3012 现场报文）
+
+- `risk::tests::observe_hits_3012_blocked_payload`：`unusual activity` + `provider_code=3012` + `status=405` 报文 → 记 strike、首次 ~900s、二次 ~1800s。
+- `mock_upstream::preview_blocked_unusual_activity_3012_surfaces_error`：同上报文经 405 返回时错误上抛且保留 `405` 与 `unusual activity` 文本（供 `observe_upstream_failure` 命中）。
+- `risk` 单元测试会设置进程级 `ZCODE_SWITCH_HOME`，**必须持 `TEST_LOCK` 串行**，否则并行测试互相覆盖 home 导致偶发失败（本次一并修复）。

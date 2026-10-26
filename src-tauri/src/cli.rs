@@ -198,6 +198,91 @@ pub fn run(args: &[String]) -> (String, i32) {
             }
             ok(json!({ "anyClaimable": any, "accounts": items }))
         }
+        // 诊断用：原样打印上游响应，排查「看不到活动 / 生效时间取自哪个字段」。
+        // --only preview|marketing|current 可只跑一个通道。
+        "claim-raw" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err("--id required"), 1);
+            };
+            let acc = match load_account(&paths, &id) {
+                Ok(a) => a,
+                Err(e) => return (err(&e), 1),
+            };
+            let mid = match ensure_virtual_device_mid(&paths, &id) {
+                Ok(m) => m,
+                Err(e) => return (err(&e), 1),
+            };
+            let only = flag(rest, "--only");
+            let want = |k: &str| only.as_deref().map_or(true, |o| o == k);
+            let pick = |r: Result<Value, String>| match r {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e }),
+            };
+            let mut out = serde_json::Map::new();
+            if want("preview") {
+                out.insert(
+                    "preview".into(),
+                    pick(crate::claim::raw_preview(
+                        &paths.home,
+                        &acc.credentials,
+                        acc.config.as_ref(),
+                        Some(mid.clone()),
+                    )),
+                );
+            }
+            if want("marketing") {
+                out.insert(
+                    "marketing".into(),
+                    pick(crate::claim::raw_marketing(
+                        &paths.home,
+                        &acc.credentials,
+                        acc.config.as_ref(),
+                        Some(mid.clone()),
+                    )),
+                );
+            }
+            if want("current") {
+                out.insert(
+                    "current".into(),
+                    pick(crate::claim::raw_current(
+                        &paths.home,
+                        &acc.credentials,
+                        acc.config.as_ref(),
+                        Some(mid.clone()),
+                    )),
+                );
+            }
+            ok(Value::Object(out))
+        }
+        // 诊断用：查该账号「已生效」的套餐（billing/current）+ 本地领取历史。
+        // 用于区分「服务端没下发活动（无资格）」与「已经领过了（此处或别处）」。
+        "claim-current" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err("--id required"), 1);
+            };
+            let acc = match load_account(&paths, &id) {
+                Ok(a) => a,
+                Err(e) => return (err(&e), 1),
+            };
+            let mid = match ensure_virtual_device_mid(&paths, &id) {
+                Ok(m) => m,
+                Err(e) => return (err(&e), 1),
+            };
+            match crate::claim::fetch_active_plans(
+                &paths.home,
+                &acc.credentials,
+                acc.config.as_ref(),
+                Some(mid),
+            ) {
+                Ok(plans) => ok(json!({
+                    "id": acc.id,
+                    "name": acc.name,
+                    "plans": plans,
+                    "history": claim_history_for(&paths, &id),
+                })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         "behavior" => {
             let las = flag(rest, "--launch-after-switch");
             let ctt = flag(rest, "--close-to-tray");

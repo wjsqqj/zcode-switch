@@ -1052,3 +1052,48 @@ input:focus-visible,
   font-size: 11.5px;
   color: var(--ink-dim);
 }
+
+/* 冷却/忙态仍可点击：不用 disabled，否则点击被浏览器吞掉、用户得不到任何提示 */
+.icon-btn.is-off,
+.btn-ghost.is-off,
+.btn-primary.is-off,
+.btn-claim.is-off {
+  opacity: .55;
+}
+.icon-btn { position: relative; }
+.ic-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  min-width: 14px;
+  padding: 0 2px;
+  border-radius: 7px;
+  background: var(--amber-deep);
+  color: #191308;
+  font-size: 9px;
+  line-height: 14px;
+  text-align: center;
+}
+
+/* 渲染异常提示条：挂在 body 上，render 全挂时依然可见可关闭 */
+#err-bar {
+  position: sticky;
+  top: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: #3a2222;
+  color: #f3c9c9;
+  border-bottom: 1px solid #6a3535;
+  font-size: 12.5px;
+}
+#err-bar .eb-close {
+  margin-left: auto;
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+}
