@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-switch"
-version = "1.7.0-beta.1"
+version = "1.7.1-Z.EMAIL"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

@@ -1,6 +1,6 @@
 [package]
 name = "zcode-switch"
-version = "1.7.0-beta.1"
+version = "1.7.1-Z.EMAIL"
 description = "ZCode 账号切换器"
 license = "MIT"
 edition = "2021"
