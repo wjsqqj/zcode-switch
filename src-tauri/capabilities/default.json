@@ -2,5 +2,12 @@
   "identifier": "default",
   "description": "zcode-switch 默认权限（settings 窗口运行时创建，一并授权；captcha 窗口见 captcha.json）",
   "windows": ["main", "settings"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "core:window:allow-is-focused",
+    "core:window:allow-request-user-attention",
+    "dialog:default",
+    "notification:default"
+  ]
 }

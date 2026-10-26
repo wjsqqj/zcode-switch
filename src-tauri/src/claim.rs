@@ -51,6 +51,31 @@ pub struct ClaimPlan {
     pub grants: Vec<String>,
     #[serde(default)]
     pub grant_items: Vec<ClaimGrant>,
+    /// 活动元数据（仅 marketing/touch 通道携带；preview 通道为 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<ActivityCampaign>,
+}
+
+/// 活动按钮动作（如 `claim_zcode_plan` + plan_id）。
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityAction {
+    pub kind: String,
+    pub plan_id: Option<String>,
+}
+
+/// marketing/touch delivery 上的活动元数据，供 UI 详情弹框使用。
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityCampaign {
+    pub campaign_id: String,
+    /// `banner` | `popup` | 空
+    pub position: String,
+    pub title: String,
+    pub body: String,
+    pub buttons: Vec<ActivityAction>,
+    pub starts_at: Option<i64>,
+    pub ends_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -419,6 +444,17 @@ pub fn raw_current(
     fetch_raw_json(&url, &token, device_mid, "current")
 }
 
+/// 活动探测专用入口：**只**走 `marketing/touch`。
+/// 不领取、不写领取历史、不发 activation 事件——探测是只读行为，必须与领取链路口径隔离。
+pub fn probe_marketing_only(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Vec<ClaimPlan> {
+    marketing_touch_plans(home, creds, config, device_mid)
+}
+
 /// 营销触达通道：新版活动（客户端弹窗/banner）只经 marketing/touch 下发，billing/preview 不返回。
 /// deliveries 的按钮带可领 plan_id（action.type = claim_zcode_plan），payload 在 background/hero 的
 /// args.zcode_plan 内嵌完整套餐结构（字段与 preview plans 同构）。任何失败静默降级为空列表并记本地
@@ -462,7 +498,15 @@ pub fn marketing_touch_plans(
         .map(|a| a.as_slice())
         .unwrap_or(&[])
     {
+        let before = payloads.len();
         walk_marketing_delivery(d, &mut payloads, &mut button_ids);
+        // 同一个 delivery 内扫出的 plan 共享该 delivery 的活动元数据（来源一致才可靠）
+        let meta = campaign_meta_from_delivery(d);
+        for p in payloads.iter_mut().skip(before) {
+            if p.campaign.is_none() {
+                p.campaign = Some(meta.clone());
+            }
+        }
     }
     let missing: Vec<String> = button_ids
         .iter()
@@ -477,12 +521,162 @@ pub fn marketing_touch_plans(
             priority: 0,
             grants: vec![],
             grant_items: vec![],
+            campaign: None,
         });
     }
     let mut out: Vec<ClaimPlan> = payloads;
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
     out.dedup_by(|a, b| a.plan_id == b.plan_id);
     out
+}
+
+fn collect_strings(v: &Value, keys: &[&str], out: &mut Vec<String>) {
+    match v {
+        Value::Array(items) => items.iter().for_each(|it| collect_strings(it, keys, out)),
+        Value::Object(map) => {
+            for (k, val) in map {
+                if keys.contains(&k.as_str()) {
+                    if let Some(s) = val.as_str() {
+                        let s = s.trim();
+                        if !s.is_empty() && s.len() < 400 && !out.iter().any(|x| x == s) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                collect_strings(val, keys, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_buttons(v: &Value, out: &mut Vec<ActivityAction>) {
+    match v {
+        Value::Array(items) => items.iter().for_each(|it| collect_buttons(it, out)),
+        Value::Object(map) => {
+            if let Some(action) = map.get("action").and_then(|a| a.as_object()) {
+                let kind = action.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                if !kind.is_empty() {
+                    let plan_id = action
+                        .get("args")
+                        .and_then(|a| a.get("plan_id"))
+                        .and_then(|p| p.as_str())
+                        .or_else(|| action.get("planId").and_then(|p| p.as_str()))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    out.push(ActivityAction { kind, plan_id });
+                }
+            }
+            for val in map.values() {
+                collect_buttons(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 服务端文案既可能是纯字符串，也可能是 `{content, format}` 结构（format=plaintext|html）。
+fn text_of(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+        return None;
+    }
+    v.get("content")
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 文案里夹带 HTML（如 `<p class=...>`）时，UI 只展示纯文本。
+fn strip_html(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_text(v: &Value, paths: &[&str]) -> String {
+    for p in paths {
+        if let Some(t) = v.pointer(p).and_then(text_of) {
+            return t;
+        }
+    }
+    String::new()
+}
+
+/// 从一条 delivery 里宽松抽取活动元数据（字段位置随服务端版本变化，不做严格 schema）。
+/// 文案优先取 `success_popup.{title,description}`（实测有效），时间窗兜底取内嵌 `zcode_plan`。
+fn campaign_meta_from_delivery(d: &Value) -> ActivityCampaign {
+    let mut titles = Vec::new();
+    collect_strings(d, &["title", "heading", "headline"], &mut titles);
+    let mut bodies = Vec::new();
+    collect_strings(d, &["text", "subtitle", "description", "content", "body"], &mut bodies);
+    let mut buttons = Vec::new();
+    collect_buttons(d, &mut buttons);
+
+    let title = {
+        let t = first_text(
+            d,
+            &["/banner/success_popup/title", "/popup/title", "/banner/title", "/title"],
+        );
+        if t.is_empty() { titles.into_iter().next().unwrap_or_default() } else { t }
+    };
+    let body = {
+        let b = strip_html(&first_text(
+            d,
+            &[
+                "/banner/success_popup/description",
+                "/popup/description",
+                "/banner/description",
+                "/description",
+                "/banner/text",
+                "/text",
+            ],
+        ));
+        if b.is_empty() {
+            strip_html(&bodies.into_iter().next().unwrap_or_default())
+        } else {
+            b
+        }
+    };
+    let sec = |k: &str| {
+        let paths = [
+            format!("/{k}"),
+            format!("/banner/background/args/zcode_plan/{k}"),
+            format!("/popup/hero/args/zcode_plan/{k}"),
+            format!("/background/args/zcode_plan/{k}"),
+        ];
+        paths
+            .iter()
+            .find_map(|p| d.pointer(p).and_then(|x| x.as_i64()))
+            .map(|s| s * 1000)
+    };
+
+    ActivityCampaign {
+        campaign_id: str_field(d, "campaign_id", "campaignId").unwrap_or("").trim().to_string(),
+        position: str_field(d, "resource_position", "resourcePosition")
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        title,
+        body,
+        buttons,
+        starts_at: sec("starts_at"),
+        ends_at: sec("ends_at"),
+    }
 }
 
 fn walk_marketing_delivery(v: &Value, payloads: &mut Vec<ClaimPlan>, button_ids: &mut Vec<String>) {
@@ -527,7 +721,17 @@ fn walk_marketing_delivery(v: &Value, payloads: &mut Vec<ClaimPlan>, button_ids:
 /// 合并 marketing/touch 活动套餐到 preview 结果：按 plan_id 去重（preview 优先），priority 降序。
 pub fn merge_marketing_plans(mut base: Vec<ClaimPlan>, extra: Vec<ClaimPlan>) -> Vec<ClaimPlan> {
     for p in extra {
-        if !base.iter().any(|b| b.plan_id == p.plan_id) {
+        if let Some(b) = base.iter_mut().find(|b| b.plan_id == p.plan_id) {
+            // preview 优先，但 preview 的 plan 没有活动元数据（campaign_id/展示位/文案/时间窗）。
+            // 同一 plan_id 在 marketing 通道里带着元数据时，必须把它补到 preview 那份上，
+            // 否则前端永远显示「活动 ID 未提供」。
+            if b.campaign.is_none() {
+                b.campaign = p.campaign;
+            }
+            if b.description.is_empty() {
+                b.description = p.description;
+            }
+        } else {
             base.push(p);
         }
     }
@@ -804,6 +1008,7 @@ fn parse_plan(p: &Value) -> Option<ClaimPlan> {
         plan_id,
         grants,
         grant_items,
+        campaign: None,
     })
 }
 

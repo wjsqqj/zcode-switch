@@ -170,7 +170,41 @@ impl ClaimError {
 
 新增任何 billing 命令时，先对照此表决定冷却期行为，不得遗漏。
 
-### 13.3 测试侧请求规格断言
+### 13.3 活动中心契约（2026-10-27 补充，任务 10-26-claim-activity-center）
+
+**数据来源与合并**
+
+- `billing/preview` 与 `marketing/touch` 可能下发**同一个 plan_id**；preview 优先去重，但 **preview 的 plan 没有活动元数据**（`campaign_id` / `resource_position` / 文案 / 时间窗）。
+  → `merge_marketing_plans` 必须在 `b.campaign.is_none()` 时从 marketing 那份补齐，否则「活动 ID / 展示位」永远显示「未提供」（已有回归用例 `merge_adopts_campaign_meta_from_marketing`）。
+- 真实 payload 的文案是 `{content, format}`（format=plaintext|html）：title 取 `banner.success_popup.title`，正文取 `banner.success_popup.description` 并去 HTML；时间窗兜底取 `banner.background.args.zcode_plan.{starts_at,ends_at}`。
+- 前端可领来源唯一：`claimablePlansFor(id)`（刷新结果优先 + 探测结果兜底 + 按 plan_id 去重，**排除已在 `claimedState` 或已打标的 plan**）。行内条、活动弹框、自动领取都必须用它。
+
+**探测与静默**
+
+- `activity_probe(ids)` 只走 `marketing/touch`，不领取、不写 `claim-history.json`、不发 activation；经 `run_blocking`；冷却账号返回在 `skipped`。
+- 调度：活跃窗口 20min + U(0,5min)；每轮 2 账号、各自 U(0,5min) 延迟后**串行**（间隔 20–90s）；账号级最小间隔 60min；12:00–16:00 与达配额（每账号 20 次）后降频 3h（不停止）。
+- 静默：探到有效期内活动 → 该账号静默到 `ends_at`（只约束周期探测）；**启动基线强制探测全部账号**（每账号 1 请求），并把结果写入持久化目录 `localStorage["zsw-activity-catalog"]`，用于重启后展示（否则静默 + 内存态会表现为「列表空白/无角标/无提醒」）。
+- 提醒去重：可领 → 会话级（每次启动对未领活动再提醒一次）；已领取 → 持久级（只提醒一次）。
+
+**通知可见性（Windows 便携版）**
+
+- Toast 依赖安装版快捷方式/AppUserModelID，便携版不可靠；可靠通道为：托盘图标红点交替闪烁（持续到用户点开活动）+ 托盘右键菜单 `【新活动】…` + tooltip 前缀 + 窗口标题。
+- 停止闪烁的唯一入口：打开活动详情（按钮 / 弹窗 / 托盘菜单）。
+
+**自动领取准入**
+
+- `autoTargets()` 的 plan 必须来自 `claimablePlansFor(accountId)`（只读 `claimable` 会让探测发现的活动永远进不了自动领取）。
+- 准入四条件：`status==="claimable"` + 已开始（`startsAt/effectiveAt ≤ now`）+ 未过期（`endsAt > now`）+ 未被标记/`claimHold`/账号冷却拦住；空集 → **零上游请求**。
+- 「自动领取」与「到点自动领取」共用 `runClaimTargets()`：前者 2min 首轮 + 10min 间隔，后者启动 30s 首查 + 每 60s 检查「已到点未领」。
+- 成功后写 `localStorage["zsw-claim-marks"]`（`accountId|planId`）并从 `activities`/`claimable` 摘除该 plan。
+- 超时取消必须用 `cancelClaimIfMine(id, planId)`（依赖 `claim_pending`），**不得**无条件 `claim_cancel`（会误取消用户手动的领取）。
+- `3007/挑战` 持有期 60min（拒码是风控信号且 3007 不自动重试）。
+
+**前端渲染纪律**
+
+- 弹窗面板**禁止** `stopPropagation()`：所有 `click="actions.xxx()"` 依赖 document 级委托，被面板拦断后会「点了没反应」（活动弹框「领取」按钮踩过）。关闭逻辑应为 `if (e.target === mask) close()`。
+
+### 13.4 测试侧请求规格断言
 
 `tests/support` 的 mock 会记录每条请求的 `path/headers/body`（`MockUpstream::requests()`），用例应同时断言：
 

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ic } from "./icons.js";
-import { t, has, errCode, stripErr } from "./i18n.js";
+import { t, has, errCode, stripErr, localeTag } from "./i18n.js";
 
 document.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -191,6 +191,86 @@ export function openPwModal(m) {
     }
   }
   go.addEventListener("click", confirm);
+}
+
+/// 右下角活动弹窗（与全局居中 toast 区分）：可点击直达详情，8s 自动消失。
+export function activityToast(text, onClick) {
+  let zone = document.querySelector(".act-toast-zone");
+  if (!zone) {
+    zone = document.createElement("div");
+    zone.className = "act-toast-zone";
+    document.body.appendChild(zone);
+  }
+  const el = document.createElement("button");
+  el.className = "act-toast";
+  el.type = "button";
+  el.textContent = text;
+  const close = () => el.remove();
+  el.addEventListener("click", () => { close(); onClick?.(); });
+  zone.appendChild(el);
+  setTimeout(close, 8000);
+}
+
+/// 活动汇总弹框：分组（可领 / 已领取 / 已过期）+ 可展开详情。
+/// m: { rows, focusAccount }
+export function openActivityModal(m) {
+  document.querySelector(".act-mask")?.remove();
+  const rows = m?.rows || [];
+  const groups = [
+    { k: "claimable", label: t("act.groupClaimable") },
+    { k: "claimed", label: t("act.groupClaimed") },
+    { k: "expired", label: t("act.groupExpired") },
+  ];
+  const fmt = (ms) => (ms ? new Date(ms).toLocaleString(localeTag(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : t("act.notProvided"));
+  const timeText = (r) => {
+    const startMs = r.effectiveAt ?? r.startsAt ?? null;
+    const pending = !!startMs && startMs > Date.now();
+    return t(pending ? "act.pendingRange" : "act.timeRange", { start: fmt(startMs), end: fmt(r.endsAt) });
+  };
+  const itemHtml = (r) => `
+    <details class="act-item ${r.status}"${m?.focusAccount && r.accountId === m.focusAccount ? " open" : ""}>
+      <summary>
+        <span class="act-name">${esc(r.title || r.planId)}</span>
+        <span class="act-acct">${esc(r.accountName)}</span>
+        <span class="act-time${r.status === "claimable" ? " warn-line" : ""}">${esc(timeText(r))}</span>
+      </summary>
+      <div class="act-body">
+        <div class="act-kv"><b>${t("act.campaign")}</b><span>${esc(r.campaignId || t("act.notProvided"))}</span></div>
+        <div class="act-kv"><b>${t("act.plan")}</b><span>${esc(r.planId)}</span></div>
+        <div class="act-kv"><b>${t("act.position")}</b><span>${esc(r.position ? (has(`act.pos.${r.position}`) ? t(`act.pos.${r.position}`) : r.position) : t("act.notProvided"))}</span></div>
+        <div class="act-kv"><b>${t("act.rewards")}</b><span>${esc(r.grants?.length ? r.grants.join(" · ") : t("act.notProvided"))}</span></div>
+        ${r.body ? `<div class="act-copy">${esc(r.body)}</div>` : `<div class="act-copy dim">${t("act.noMeta")}</div>`}
+        ${r.buttons?.length ? `<div class="act-kv"><b>${t("act.actions")}</b><span>${esc(r.buttons.map((b) => `${b.kind}${b.planId ? ":" + b.planId : ""}`).join(" · "))}</span></div>` : ""}
+        ${r.status === "claimable" ? `<div class="act-claim-row"><button class="btn-claim has-ic" click="actions.claim('${r.accountId}')">${ic("gift", 13)} ${t("btn.claim")}</button></div>` : ""}
+      </div>
+    </details>`;
+
+  const body = groups
+    .map((g) => {
+      const list = rows.filter((r) => r.status === g.k);
+      if (!list.length) return "";
+      return `<div class="act-group"><div class="act-group-head">${esc(g.label)} (${list.length})</div>${list.map(itemHtml).join("")}</div>`;
+    })
+    .join("") || `<div class="act-empty">${t("act.empty")}</div>`;
+
+  const mask = document.createElement("div");
+  mask.className = "act-mask";
+  mask.innerHTML = `
+    <div class="act-panel">
+      <div class="act-title">${t("act.title")}</div>
+      <div class="act-list">${body}</div>
+      <div class="act-actions-row"><button class="btn-ghost act-close">${t("common.close")}</button></div>
+    </div>`;
+  document.body.appendChild(mask);
+  const close = () => { mask.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  // 只在点击遮罩本身时关闭；**不能**在面板上 stopPropagation，
+  // 否则面板内 click="actions.xxx()" 的按钮无法冒泡到 document 级事件委托（会点了没反应）。
+  mask.addEventListener("click", (e) => {
+    if (e.target === mask) close();
+  });
+  mask.querySelector(".act-close").addEventListener("click", close);
+  document.addEventListener("keydown", onKey);
 }
 
 export function openProviderModal(m) {

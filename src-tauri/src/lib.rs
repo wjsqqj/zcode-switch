@@ -12,6 +12,7 @@ mod store;
 mod zcrypto;
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use store::*;
 use tauri::menu::{MenuBuilder, MenuItem};
@@ -23,6 +24,19 @@ use tauri_plugin_dialog::DialogExt;
 const TRAY_ID: &str = "main";
 
 static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 托盘 tooltip 上附加的「新活动」提示（None = 无提示）。
+/// Windows 便携版拿不到 Toast，悬停托盘图标看提示是最可靠的可见通道。
+static ACTIVITY_TIP: Mutex<Option<String>> = Mutex::new(None);
+/// 托盘闪烁开关：true 时后台线程持续交替图标，直到用户点开活动详情。
+static TRAY_FLASH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn activity_tip_guard() -> std::sync::MutexGuard<'static, Option<String>> {
+    match ACTIVITY_TIP.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 #[derive(Clone)]
 struct PendingClaim {
@@ -89,7 +103,15 @@ fn tray_menu_inner(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wr
         }
     };
 
-    let b = MenuBuilder::new(app)
+    let mut b = MenuBuilder::new(app);
+    // 有新活动时，托盘菜单顶部给出醒目入口（tooltip 小字太弱，菜单更不易被忽略）
+    if let Some(extra) = activity_tip_guard().clone().filter(|t| !t.trim().is_empty()) {
+        let label = format!("【新活动】{extra}");
+        b = b
+            .item(&MenuItem::with_id(app, "activity", &label, true, None::<&str>)?)
+            .separator();
+    }
+    let b = b
         .item(&MenuItem::with_id(app, "show", &i18n::tr("tray.show"), true, None::<&str>)?)
         .item(&MenuItem::with_id(app, "capture", &i18n::tr("tray.capture"), state.live_logged_in, None::<&str>)?)
         .separator()
@@ -118,7 +140,20 @@ pub fn rebuild_tray(app: &AppHandle) {
                 }
                 Err(_) => "Z·SWITCH".into(),
             };
+            let extra = activity_tip_guard().clone().filter(|t| !t.trim().is_empty());
+            let has_extra = extra.is_some();
+            let tip = match &extra {
+                // 把「新活动」放最前面：tooltip 前面部分更容易被看见
+                Some(e) => format!("【新活动】{e} · {tip}"),
+                None => tip,
+            };
             let _ = tray.set_tooltip(Some(&tip));
+            // Windows：仅 NIM_MODIFY 更新 szTip 有时不刷新，重设一次当前图标可强制 shell 读新提示
+            if has_extra {
+                if let Some(ic) = app2.default_window_icon().cloned() {
+                    let _ = tray.set_icon(Some(ic));
+                }
+            }
             if let Ok(menu) = tray_menu_inner(&app2) {
                 let _ = tray.set_menu(Some(menu));
             }
@@ -468,6 +503,207 @@ async fn claim_cancel(app: AppHandle) -> Result<(), String> {
     *pending_guard() = None;
     close_captcha_window(&app);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityProbeItem {
+    account_id: String,
+    name: String,
+    plans: Vec<claim::ClaimPlan>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityProbeResult {
+    items: Vec<ActivityProbeItem>,
+    /// 因风控冷却 / 账号读取失败被跳过的账号（前端用来显示「已跳过」而不是「无活动」）
+    skipped: Vec<String>,
+}
+
+/// 只读活动探测：只请求 marketing/touch，不领取、不写 claim-history、不发 activation 事件。
+/// 冷却中的账号直接跳过（零上游流量）；账号选择与节奏由前端调度器负责。
+#[tauri::command]
+async fn activity_probe(ids: Vec<String>) -> Result<ActivityProbeResult, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        let mut items = Vec::new();
+        let mut skipped = Vec::new();
+        for id in ids {
+            if risk::is_cooling(&paths, &id) {
+                skipped.push(id);
+                continue;
+            }
+            let Ok(mid) = store::ensure_virtual_device_mid(&paths, &id) else {
+                skipped.push(id);
+                continue;
+            };
+            let Ok(acc) = load_account(&paths, &id) else {
+                skipped.push(id);
+                continue;
+            };
+            let plans = claim::probe_marketing_only(
+                &paths.home,
+                &acc.credentials,
+                acc.config.as_ref(),
+                Some(mid),
+            );
+            items.push(ActivityProbeItem { account_id: id, name: acc.name, plans });
+        }
+        Ok(ActivityProbeResult { items, skipped })
+    })
+    .await
+}
+
+fn append_rolling_log(name: &str, cap: usize, message: &str) -> Result<(), String> {
+    let dir = Paths::detect().store_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = dir.join(name);
+    let mut lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    lines.push(format!("[{ts}] {}", message.replace('\n', " ⏎ ")));
+    if lines.len() > cap {
+        let excess = lines.len() - cap;
+        lines.drain(0..excess);
+    }
+    std::fs::write(&file, lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
+
+/// 当前待领取的那一笔（用于「只取消自己发起的领取」）。
+#[tauri::command]
+fn claim_pending() -> Option<serde_json::Value> {
+    pending_guard()
+        .as_ref()
+        .map(|p| json!({ "accountId": p.account_id, "planId": p.plan_id }))
+}
+
+/// 设置「新活动」提示：托盘 tooltip 附加文案（None 清除）。
+/// 便携版拿不到 Windows Toast 时，悬停托盘图标是可见性兜底。
+#[tauri::command]
+async fn set_activity_tip(app: AppHandle, tip: Option<String>) -> Result<(), String> {
+    let cleaned = tip.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    {
+        let mut g = activity_tip_guard();
+        *g = cleaned.clone();
+    }
+    rebuild_tray(&app);
+    let _ = append_rolling_log(
+        "probe.log",
+        500,
+        &format!("tray tip -> {:?}", cleaned),
+    );
+    if app.tray_by_id(TRAY_ID).is_none() {
+        return Err("tray not found".into());
+    }
+    Ok(())
+}
+
+/// 原图标 + 右下角红点徽标（钉钉式）：红点出现/消失交替，比整图标染色自然。
+fn badged_icon(base: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+    let (w, h) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    let cx = w as f32 * 0.74;
+    let cy = h as f32 * 0.74;
+    let r = (h as f32 * 0.22).max(3.0);
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            if d <= r {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i] = 235;
+                rgba[i + 1] = 64;
+                rgba[i + 2] = 56;
+                rgba[i + 3] = 255;
+            } else if d <= r + 1.5 {
+                let i = ((y * w + x) * 4) as usize;
+                rgba[i] = 255;
+                rgba[i + 1] = 255;
+                rgba[i + 2] = 255;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, w, h)
+}
+
+/// 托盘图标交替闪烁（Windows 托盘没有闪烁 API，用图标交替模拟）。
+/// 提醒态 = 原图标 + 右下角红点徽标，与常态来回切换 `times` 轮后恢复（0 = 直到点开活动）。
+#[tauri::command]
+async fn tray_flash(app: AppHandle, times: Option<u32>) -> Result<(), String> {
+    use tauri::image::Image;
+    let base = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| "no window icon".to_string())?;
+    let (w, h) = (base.width(), base.height());
+    let base: Image<'static> = Image::new_owned(base.rgba().to_vec(), w, h);
+    let attention: Image<'static> = badged_icon(&base);
+    // times: None/0 = 持续闪烁直到用户点开活动（tray_flash_stop），
+    // Some(n) = 闪 n 轮后自动停止（仅测试用）。
+    let rounds = times.unwrap_or(0);
+    TRAY_FLASH_ACTIVE.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let mut count = 0u32;
+        while TRAY_FLASH_ACTIVE.load(Ordering::SeqCst) {
+            count += 1;
+            if rounds > 0 && count > rounds * 2 {
+                TRAY_FLASH_ACTIVE.store(false, Ordering::SeqCst);
+                break;
+            }
+            let holder = app.clone();
+            let inner = app.clone();
+            let ic = attention.clone();
+            let _ = holder.run_on_main_thread(move || {
+                if let Some(t) = inner.tray_by_id(TRAY_ID) {
+                    let _ = t.set_icon(Some(ic));
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(420));
+            let holder = app.clone();
+            let inner = app.clone();
+            let ic = base.clone();
+            let _ = holder.run_on_main_thread(move || {
+                if let Some(t) = inner.tray_by_id(TRAY_ID) {
+                    let _ = t.set_icon(Some(ic));
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(420));
+        }
+        let _ = append_rolling_log("probe.log", 500, "tray flash done");
+    });
+    Ok(())
+}
+
+/// 停止托盘闪烁（用户已点开活动详情），并恢复常态图标。
+#[tauri::command]
+async fn tray_flash_stop(app: AppHandle) -> Result<(), String> {
+    TRAY_FLASH_ACTIVE.store(false, Ordering::SeqCst);
+    let owned = app.default_window_icon().map(|ic| {
+        let (w, h) = (ic.width(), ic.height());
+        tauri::image::Image::new_owned(ic.rgba().to_vec(), w, h)
+    });
+    if let Some(ic) = owned {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(t) = app2.tray_by_id(TRAY_ID) {
+                let _ = t.set_icon(Some(ic));
+            }
+        });
+    }
+    Ok(())
+}
+
+/// 探测留痕：`{home}/.zcode-switch/probe.log`（500 行滚动）。
+/// 用于回答「开关开了但没探到」这类问题：能查到每轮选了谁、返回几条、是否被跳过。
+#[tauri::command]
+async fn log_probe(message: String) -> Result<(), String> {
+    run_blocking(move || append_rolling_log("probe.log", 500, &message)).await
 }
 
 /// 前端异常落盘：`{home}/.zcode-switch/client-error.log`，最多保留 200 行。
@@ -1136,6 +1372,8 @@ async fn set_behavior(
     close_to_tray: Option<bool>,
     hot_switch: Option<bool>,
     auto_claim: Option<bool>,
+    activity_probe: Option<bool>,
+    claim_at_effective: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -1151,6 +1389,12 @@ async fn set_behavior(
     }
     if let Some(v) = auto_claim {
         s.auto_claim = Some(v);
+    }
+    if let Some(v) = activity_probe {
+        s.activity_probe = Some(v);
+    }
+    if let Some(v) = claim_at_effective {
+        s.claim_at_effective = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
@@ -1421,6 +1665,7 @@ pub fn run() {
             show_main(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1442,6 +1687,12 @@ pub fn run() {
             claim_captcha_config,
             claim_captcha_submit,
             claim_cancel,
+            claim_pending,
+            activity_probe,
+            set_activity_tip,
+            tray_flash,
+            tray_flash_stop,
+            log_probe,
             log_client_error,
             oauth_providers,
             oauth_begin,
@@ -1496,6 +1747,10 @@ pub fn run() {
                     let id = event.id().as_ref().to_string();
                     match id.as_str() {
                         "show" => show_main(app),
+                        "activity" => {
+                            TRAY_FLASH_ACTIVE.store(false, Ordering::SeqCst);
+                            let _ = app.emit("tray-activity", ());
+                        }
                         "quit" => app.exit(0),
                         other => run_tray_action(app.clone(), other.to_string()),
                     }

@@ -78,6 +78,112 @@ fn marketing_extracts_payloads_buttons_and_minimal_entries() {
 
 /// 用户现场报文（2026-10-26）：405 + provider_code=3012 + unusual activity。
 /// 期望：错误上抛（含 405 与 unusual activity 文本），供 risk::observe_upstream_failure 记 strike。
+/// 回归：preview 与 marketing 同时下发同一 plan 时，preview 优先去重**不得丢掉活动元数据**。
+/// 现场表现就是「活动 ID / 展示位 永远未提供」。
+#[test]
+fn merge_adopts_campaign_meta_from_marketing() {
+    let base = vec![claim::ClaimPlan {
+        plan_id: "p9".into(),
+        name: "P9".into(),
+        description: String::new(),
+        priority: 10,
+        grants: vec![],
+        grant_items: vec![],
+        campaign: None,
+    }];
+    let mut with_meta = base[0].clone();
+    with_meta.description = "来自 marketing 的文案".into();
+    with_meta.campaign = Some(claim::ActivityCampaign {
+        campaign_id: "2101141259813175296".into(),
+        position: "banner".into(),
+        title: "ZCODE GLOBAL BUILD".into(),
+        body: "3亿 Tokens".into(),
+        buttons: vec![],
+        starts_at: Some(1793012400000),
+        ends_at: Some(1793062800000),
+    });
+    let merged = claim::merge_marketing_plans(base, vec![with_meta]);
+    assert_eq!(merged.len(), 1, "同一 plan_id 必须去重");
+    let c = merged[0].campaign.as_ref().expect("必须采纳 marketing 的活动元数据");
+    assert_eq!(c.campaign_id, "2101141259813175296");
+    assert_eq!(c.position, "banner");
+    assert_eq!(merged[0].description, "来自 marketing 的文案");
+}
+
+/// 探测只允许走 marketing/touch：不得命中 billing/*，也不得写领取历史（只读纪律）。
+#[test]
+fn probe_only_touches_marketing_and_writes_no_history() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![
+        Route::json(
+            "/api/v1/marketing/touch",
+            vec![(
+                200,
+                r#"{"code":0,"data":{"deliveries":[{"campaign_id":"c1","banner":{"args":{"zcode_plan":{"plan_id":"p1","name":"P1","priority":1,"entitlements":[{"show_name":"GLM","meter":"model_usage","unit_type":"token","grant_units":1,"period":"one_time"}]}}}}]}}"#,
+            )],
+        ),
+        // 故意挂上 preview 路由：若探测误走 billing，下面的断言会失败
+        Route::json(
+            "/api/v1/zcode-plan/billing/preview",
+            vec![(200, r#"{"code":0,"data":{"plans":[]}}"#)],
+        ),
+    ]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mprobe");
+    let plans = claim::probe_marketing_only(home.path(), &creds, None, None);
+    del_env("ZCODE_API_BASE");
+
+    assert_eq!(plans.len(), 1, "应解析出 1 条活动");
+    let paths: Vec<String> = mock.requests().iter().map(|r| r.path.clone()).collect();
+    assert!(paths.iter().any(|p| p.contains("/marketing/touch")), "必须请求 marketing：{paths:?}");
+    assert!(
+        paths.iter().all(|p| !p.contains("/billing/")),
+        "探测不得请求 billing 端点，实际：{paths:?}"
+    );
+    assert!(
+        !home.path().join(".zcode-switch").join("claim-history.json").exists(),
+        "探测不得写领取历史"
+    );
+}
+
+/// 活动元数据解析：campaign_id / 展示位 / 文案 / 按钮动作 / 时间窗都要带出来，
+/// 否则活动详情弹框只能显示「未提供」。
+#[test]
+fn marketing_payload_carries_campaign_meta() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/marketing/touch",
+        vec![(
+            200,
+            r#"{"code":0,"data":{"server_time":1,"deliveries":[{
+                "campaign_id":"camp-1","resource_position":"banner","priority":9,
+                "starts_at":1793013353,"ends_at":1793062800,
+                "banner":{
+                    "title":"ZCODE GLOBAL BUILD","text":"GLM-5.3-Flash 3亿",
+                    "buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p9"}}}],
+                    "args":{"zcode_plan":{"plan_id":"p9","name":"ZCODE GLOBAL BUILD","priority":9,
+                        "entitlements":[{"show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","grant_units":300000000,"period":"one_time"}]}}
+                }}]}}"#,
+        )],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mcamp");
+    let plans = claim::marketing_touch_plans(home.path(), &creds, None, None);
+    del_env("ZCODE_API_BASE");
+
+    let p = plans.iter().find(|p| p.plan_id == "p9").expect("应解析出 p9");
+    let c = p.campaign.as_ref().expect("campaign 元数据必须带出");
+    assert_eq!(c.campaign_id, "camp-1");
+    assert_eq!(c.position, "banner");
+    assert_eq!(c.title, "ZCODE GLOBAL BUILD");
+    assert!(c.body.contains("3亿"), "文案应带出，实际：{}", c.body);
+    assert_eq!(c.buttons.len(), 1);
+    assert_eq!(c.buttons[0].kind, "claim_zcode_plan");
+    assert_eq!(c.buttons[0].plan_id.as_deref(), Some("p9"));
+    assert_eq!(c.starts_at, Some(1793013353000));
+    assert_eq!(c.ends_at, Some(1793062800000));
+}
+
 #[test]
 fn preview_blocked_unusual_activity_3012_surfaces_error() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -122,11 +228,12 @@ fn merge_prefers_preview_and_sorts_by_priority() {
         priority: 10,
         grants: vec![],
         grant_items: vec![],
+        campaign: None,
     }];
     let extra = vec![
-        claim::ClaimPlan { plan_id: "p1".into(), name: "dup".into(), description: String::new(), priority: 99, grants: vec![], grant_items: vec![] },
-        claim::ClaimPlan { plan_id: "p2".into(), name: "P2".into(), description: String::new(), priority: 50, grants: vec![], grant_items: vec![] },
-        claim::ClaimPlan { plan_id: "p3".into(), name: "P3".into(), description: String::new(), priority: 1, grants: vec![], grant_items: vec![] },
+        claim::ClaimPlan { plan_id: "p1".into(), name: "dup".into(), description: String::new(), priority: 99, grants: vec![], grant_items: vec![], campaign: None },
+        claim::ClaimPlan { plan_id: "p2".into(), name: "P2".into(), description: String::new(), priority: 50, grants: vec![], grant_items: vec![], campaign: None },
+        claim::ClaimPlan { plan_id: "p3".into(), name: "P3".into(), description: String::new(), priority: 1, grants: vec![], grant_items: vec![], campaign: None },
     ];
     let merged = claim::merge_marketing_plans(base, extra);
     let ids: Vec<&str> = merged.iter().map(|p| p.plan_id.as_str()).collect();

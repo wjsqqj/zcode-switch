@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Rust/Tauri 后端编码约定与验证命令"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "关闭逻辑必须收敛到 store::kill_zcode 单一入口"}
