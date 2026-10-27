@@ -72,7 +72,7 @@ export const zh = {
   "m.claimAcctTimeout": "「{name}」验证超时，已跳过",
   "m.claimFailed": "「{name}」领取失败：{msg}",
   "m.claimOk": "「{name}」已领取「{plan}」",
-  "m.claimStartsAt": "额度将于 {time} 生效",
+  "m.claimEffectiveAt": "额度将于 {time} 生效",
   "m.claimEndsAt": "有效期至 {time}",
   "m.claimNextAt": "，{time} 后可再领",
   "claim.untilDate": "至 {date}",

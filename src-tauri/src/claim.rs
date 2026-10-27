@@ -94,6 +94,8 @@ pub struct ClaimOutcome {
     pub plan_name: String,
     pub starts_at: Option<i64>,
     pub ends_at: Option<i64>,
+    /// 权益真实生效时间（ms）：`entitlements[].effective_at` 最小值；0 = 立即生效。
+    pub effective_at: Option<i64>,
     pub server_time: Option<i64>,
 }
 

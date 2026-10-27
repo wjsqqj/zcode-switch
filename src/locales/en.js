@@ -72,7 +72,7 @@ export const en = {
   "m.claimAcctTimeout": "\"{name}\" verification timed out — skipped",
   "m.claimFailed": "\"{name}\" claim failed: {msg}",
   "m.claimOk": "\"{name}\" claimed \"{plan}\"",
-  "m.claimStartsAt": "Credits activate at {time}",
+  "m.claimEffectiveAt": "Credits activate at {time}",
   "m.claimEndsAt": "Valid until {time}",
   "m.claimNextAt": " — available again after {time}",
   "claim.untilDate": "until {date}",

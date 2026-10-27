@@ -145,7 +145,7 @@ pub struct Settings {
     /// 活动探测（默认关）：开启后按抖动节奏只读探测 marketing/touch，发现新活动提醒。
     #[serde(default)]
     pub activity_probe: Option<bool>,
-    /// 到点自动领取（默认关，依赖 auto_claim）：活动生效时刻触发一次自动领取。
+    /// 到点自动领取（默认关，依赖 auto_claim）：活动开始后触发一次自动领取。
     #[serde(default)]
     pub claim_at_effective: Option<bool>,
 }

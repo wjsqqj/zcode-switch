@@ -1852,7 +1852,8 @@ listen("claim://result", (ev) => {
   } else {
     const bits = [];
     const now = p.serverTime || Date.now();
-    if (p.startsAt && p.startsAt > now) bits.push(t("m.claimStartsAt", { time: new Date(p.startsAt).toLocaleString(localeTag(), { hour12: false }) }));
+    const effAt = p.effectiveAt ?? null;
+    if (effAt && effAt > now) bits.push(t("m.claimEffectiveAt", { time: new Date(effAt).toLocaleString(localeTag(), { hour12: false }) }));
     if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
     toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }

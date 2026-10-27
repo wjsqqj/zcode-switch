@@ -463,12 +463,23 @@ async fn claim_captcha_submit(
                     .pointer("/data/server_time")
                     .and_then(|x| x.as_i64())
                     .map(|s| s * 1000);
+                // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），starts_at 只是活动开始
+                let effective_at = v
+                    .pointer("/data/plan/entitlements")
+                    .and_then(|e| e.as_array())
+                    .and_then(|arr| {
+                        arr.iter()
+                            .filter_map(|it| it.get("effective_at").and_then(|x| x.as_i64()))
+                            .min()
+                    })
+                    .map(|s| s * 1000);
                 let outcome = claim::ClaimOutcome {
                     account_id: pending.account_id.clone(),
                     account_name: pending.account_name.clone(),
                     plan_name: pending.plan_name.clone(),
                     starts_at: ms("starts_at"),
                     ends_at: ms("ends_at"),
+                    effective_at,
                     server_time,
                 };
                 let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
