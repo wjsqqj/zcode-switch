@@ -140,9 +140,36 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
     bar.appendChild(t);
     document.body.appendChild(bar);
   };
+  // 授权确认页自动点「授权」：第三方登录（Google / GitHub）回调后常停在这一页，
+  // 按钮文案不固定，先按关键词找；找不到时若页面上只有一个可点按钮也点它（排除取消 / 返回 / 登录类）。
+  var autoAuthorize = function () {
+    if (location.pathname.indexOf('/oauth/authorize') < 0) return;
+    var tries = 0;
+    var timer = setInterval(function () {
+      if (++tries > 120) { clearInterval(timer); return; }
+      var bar = document.getElementById(BAR_ID);
+      var all = document.querySelectorAll('button,a,[role="button"]');
+      var others = [];
+      var hit = null;
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if ((bar && bar.contains(el)) || el.offsetParent === null) continue;
+        var raw = (el.innerText || '').trim();
+        var txt = raw.toLowerCase();
+        if (!raw || raw.length > 24) continue;
+        if (/cancel|deny|拒绝|取消|返回|back|login|sign|登录/.test(txt)) continue;
+        if (/授权|同意|允许|authorize|allow|agree|continue|确认|继续/.test(txt)) { hit = el; break; }
+        others.push(el);
+      }
+      var btn = hit || (others.length === 1 ? others[0] : null);
+      if (!btn) return;
+      clearInterval(timer);
+      btn.click();
+    }, 500);
+  };
   var bootTries = 0;
   var boot = function () {
-    if (document.body) { render(); consume(); return; }
+    if (document.body) { render(); consume(); autoAuthorize(); return; }
     if (++bootTries > 50) return;
     setTimeout(boot, 100);
   };
