@@ -222,10 +222,12 @@ export function openActivityModal(m) {
     { k: "expired", label: t("act.groupExpired") },
   ];
   const fmt = (ms) => (ms ? new Date(ms).toLocaleString(localeTag(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : t("act.notProvided"));
+  const fmtEffective = (ms) => (ms === 0 ? t("act.effectiveNow") : fmt(ms));
+  const statusLabel = (s) => groups.find((g) => g.k === s)?.label || s;
   const timeText = (r) => {
     const startMs = r.effectiveAt ?? r.startsAt ?? null;
     const pending = !!startMs && startMs > Date.now();
-    return t(pending ? "act.pendingRange" : "act.timeRange", { start: fmt(startMs), end: fmt(r.endsAt) });
+    return t(pending ? "act.pendingRange" : "act.timeRange", { start: fmtEffective(startMs), end: fmt(r.endsAt) });
   };
   const itemHtml = (r) => `
     <details class="act-item ${r.status}"${m?.focusAccount && r.accountId === m.focusAccount ? " open" : ""}>
@@ -235,6 +237,11 @@ export function openActivityModal(m) {
         <span class="act-time${r.status === "claimable" ? " warn-line" : ""}">${esc(timeText(r))}</span>
       </summary>
       <div class="act-body">
+        <div class="act-kv"><b>${t("act.status")}</b><span>${esc(statusLabel(r.status))}</span></div>
+        <div class="act-kv"><b>${t("act.account")}</b><span>${esc(r.accountName)}</span></div>
+        <div class="act-kv"><b>${t("act.startsAt")}</b><span>${esc(fmt(r.startsAt))}</span></div>
+        <div class="act-kv"><b>${t("act.effectiveAt")}</b><span>${esc(fmtEffective(r.effectiveAt))}</span></div>
+        <div class="act-kv"><b>${t("act.endsAt")}</b><span>${esc(fmt(r.endsAt))}</span></div>
         <div class="act-kv"><b>${t("act.campaign")}</b><span>${esc(r.campaignId || t("act.notProvided"))}</span></div>
         <div class="act-kv"><b>${t("act.plan")}</b><span>${esc(r.planId)}</span></div>
         <div class="act-kv"><b>${t("act.position")}</b><span>${esc(r.position ? (has(`act.pos.${r.position}`) ? t(`act.pos.${r.position}`) : r.position) : t("act.notProvided"))}</span></div>
