@@ -57,33 +57,17 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Z·SWITCH ${{ github.ref_name }}'
           releaseBody: |
-            ## 本次更新（v1.7.2-Z.EMAIL）
+            ## 本次更新（v1.7.3-Z.EMAIL）
 
-            ### 新增：活动中心
+            ### 修复：z.ai 登录窗口里的登录方式切换（手机号 / 邮箱 / Google / GitHub）
 
-            - 活动详情：汇总所有账号的活动，分「可领 / 已领取 / 已过期」三组；展开可见活动 ID、套餐 ID、展示位、账号、状态、活动开始 / 生效时间 / 结束时间、奖励、文案与按钮动作
-            - 活动探测（默认关）：开启后立即探测，活跃时段每 20–25 分钟随机探测 2 个账号；只读 marketing/touch，不领取、不写历史
-            - 活动提醒：新活动弹窗、托盘红点闪烁、托盘右键菜单、窗口标题，窗口隐藏时同时发系统通知
-            - 弹框内直接领取：可领条目带「领取」按钮，无需关闭弹框
-            - 到点自动领取（默认关）：启动 30s 后首查，之后每 60s 检查「已开始且未领取」的活动并尝试领取
-
-            ### 修复
-
-            - 领取刷新「点了没反应 / 界面卡死」：阻塞 I/O 移入 spawn_blocking，准入统一为 refreshGate，冷却倒计时改为局部更新
-            - 「活动 ID / 展示位未提供」：preview 与 marketing 下发同一 plan 时去重后补齐活动元数据，支持结构化文案
-            - 「已领过」的活动不显示：启动时补拉 billing/current，并持久化活动目录，重启后仍可展示
-            - 领取后「可领条 / 领取按钮」不消失
-            - 弹框内按钮点击无效
-            - 「到点自动领取」对已开始的活动不生效
-            - 自动领取超时取消误清用户手动发起的领取
-            - 可领提醒只提醒一次、错过就沉默
-
-            ### 行为调整
-
-            - 冷却期零上游流量：claim_preview 直接拒绝、claim_current 只回本地历史
-            - 3007（验证码被拒）不再自动换码重试，自动领取失败持有期延长到 60 分钟
-            - 一次性赠送池是否生效改为以 entitlements.effective_at 判定
-            - 领取提示「额度将于 {time} 生效」改用 effective_at（0 = 立即生效）
+            - **同页表单切换**：登录页把邮箱表单和手机号表单放在同一个页面（手机号表单默认隐藏）。辅助按钮条不再把它们当成两个页面：点「手机号登录」就地切出手机号表单，点「邮箱登录」就地切回邮箱表单，不再产生多余的整页跳转
+            - **修掉「已在邮箱登录页」误报**：停在 GitHub 授权页时不再拿对方页面文案做判断（GitHub 登录页自带的 `Forgot password?` 正是旧判据的命中项）；当前显示的是手机号表单时点「邮箱登录」会正确切换，而不是提示你已经在该页
+            - 新增「已在手机号登录页」提示（中 / 英文）
+            - **修掉「从 GitHub 页点手机号登录，结果停在邮箱登录页」**：跳转意图改挂在 URL fragment 与 `window.name` 上携带（`sessionStorage` 按 origin 隔离，跨域写入的意图到 z.ai 后读不到），落地后自动补点直到目标表单真的可见，并把标记从地址栏抹掉以保证只切换一次
+            - **判定更耐用**：「当前显示哪个表单」改用可见输入框的 `type` / `placeholder` / `name` 特征判断；页内切换入口改为多重探测 + 逐级降级（文字 tab → 旧版 Z.ai 图标按钮 → 短文案容器），页面结构小改不至于失效
+            - **注入幂等**：同一页面被重复注入不再叠加多个轮询、不会把「授权」点两次；授权确认页改为常驻轮询，SPA 内部路由进到授权页也能自动点「授权」
+            - 登录辅助条按域名收敛：非 z.ai 域名（GitHub / Google）只做整页跳回，不碰对方 DOM
 
             ## 关于本项目
 
@@ -93,7 +77,7 @@ jobs:
             - 实现 zai 登录接力机制：先通过官网登录页建立会话，再跳转到授权端点获取令牌
             - 在 OAuth 流程中添加邮箱辅助功能，注入 JavaScript 按钮条供用户切换邮箱登录/注册
             - 添加页面导航监控和 URL 轮询机制，确保登录完成后正确接力到授权页面
-            - 支持从手机号登录页面返回邮箱登录页面的功能
+            - 邮箱与手机号表单在同一页面上，按钮条按「当前可见表单」做页内切换，跨第三方页时靠 URL fragment 携带切换意图
 
             见 [README](https://github.com/${{ github.repository }}/blob/main/README.md) 了解完整功能。
 
@@ -111,7 +95,10 @@ jobs:
 
             SHA-256 校验和见各 `checksums-*.txt`。
           releaseDraft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # 本 fork 的正式版本带 -Z.EMAIL 后缀，需要标成 Latest；只有 -beta 才是预发布
+          #（预发布会被 GitHub 排除在 Latest 之外，所以 Latest 必须 prerelease=false）
+          prerelease: ${{ contains(github.ref_name, '-beta') }}
+          makeLatest: 'true'
           args: --bundles ${{ matrix.bundles }} ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
 
       - name: Upload portable exe + checksums (windows)
