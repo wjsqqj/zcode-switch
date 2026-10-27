@@ -824,15 +824,13 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             &format!("mode={mode} authorize={authorize} server_flow={srv_flow} expires_in={expires_in}s interval={}ms", init.poll_interval_ms),
         );
     }
-    // zai 第二段接力用服务端原始授权端点（已登录时直接发码；未登录它自己会 307 到登录页）
-    let url = init.raw_authorize_url.clone();
-    // zai：API 授权 client 没有邮箱入口，先用官网登录页建立 chat.z.ai 会话，
-    // 登录完成后再接力到这个授权端点取码（已登录 → 不再要求手机号）
-    let entry_url = if provider == "zai" {
-        oauth::ZAI_LOGIN_ENTRY_URL.to_string()
-    } else {
-        url.clone()
-    };
+    // zai 第二段接力用规范化入口（chat.z.ai/auth?...）：直接打原始 /api/oauth/authorize
+    // 会因缺少 chat.z.ai 会话被弹回登录页；走 /auth 可完成登录/SSO。
+    // 非 zai 或未规范化时 authorize_url 就是服务端原始地址。
+    let url = init.authorize_url.clone();
+    // zai：默认直接打开本次 flow 的 CLI 授权入口（chat.z.ai/auth?client_id=<CLI>&...）。
+    // 在该页用手机号 / 邮箱登录会直接建立 chat.z.ai 会话并续到授权/回调，不依赖官网跨站会话。
+    let entry_url = url.clone();
     let poll_cfg = PollCfg {
         url: init.poll_url.clone(),
         token: init.poll_token.clone(),
@@ -922,19 +920,30 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             return false;
         }
         if log_nav && url.host_str().map_or(false, |h| h.ends_with("z.ai")) {
-            flowlog::log(&flow_nav, "nav", &format!("{}{}", url.host_str().unwrap_or(""), url.path()));
+            // 只标记是否带 error 参数，不落 query（可能含 code / state 等敏感值）
+            let mark = if url.query().map_or(false, |q| q.contains("error")) { " (error)" } else { "" };
+            flowlog::log(&flow_nav, "nav", &format!("{}{}{}", url.host_str().unwrap_or(""), url.path(), mark));
         }
-        // 窗口内「邮箱登录 / 邮箱注册」按钮会把用户带回官网入口页，此时重新武装接力：
-        // 接力默认只有一次机会，手动绕回登录页后若不再武装，登录成功也不会取码
-        if url.host_str() == Some("chat.z.ai")
-            && url.path() == "/auth"
-            && url.query().map_or(false, |q| q.contains("client_id="))
-        {
-            relay_armed2.store(true, std::sync::atomic::Ordering::SeqCst);
+        let nav_host = url.host_str().unwrap_or("");
+        let nav_path = url.path();
+        // 接力状态跟随登录态：授权链路中收枪（避免打断正在进行的授权），
+        // 回到登录页（含第三方登录入口）重新武装，保证再次登录完成后仍能取码
+        if nav_host == "z.ai" || nav_host == "chat.z.ai" {
+            if is_authorize_page(nav_path) {
+                if relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    flowlog::log(&flow_relay, "relay-disarm", &format!("{nav_host}{nav_path}"));
+                }
+            } else if is_login_page(nav_path) {
+                if !relay_armed2.load(std::sync::atomic::Ordering::SeqCst) {
+                    flowlog::log(&flow_relay, "relay-rearm", &format!("{nav_host}{nav_path}"));
+                    relay_armed2.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
         }
-        // zai 第一段（官网登录页）完成 → 接力到本次 flow 的授权页取码（此时已登录，不再要求手机号）
-        if url.host_str().map_or(false, |h| h == "z.ai" || h.ends_with(".z.ai"))
-            && !is_login_page(url.path())
+        // zai 第一段（登录页）完成 → 接力到本次 flow 的授权入口取码（此时已登录，不再要求手机号）
+        if (nav_host == "z.ai" || nav_host == "chat.z.ai")
+            && !is_login_page(nav_path)
+            && !is_authorize_page(nav_path)
             && relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             flowlog::log(
@@ -990,17 +999,26 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 let ours = pending_oauth_guard().as_ref().map(|p| p.flow == guard_flow).unwrap_or(false);
-                if !ours || !armed.load(std::sync::atomic::Ordering::SeqCst) {
+                if !ours {
                     return;
                 }
                 let Some(w) = app_relay.get_webview_window("login") else { return };
                 let Ok(u) = w.url() else { continue };
                 let host = u.host_str().unwrap_or("");
-                if !(host == "z.ai" || host.ends_with(".z.ai")) || is_login_page(u.path()) {
+                let path = u.path();
+                if !(host == "z.ai" || host == "chat.z.ai") {
+                    continue;
+                }
+                if is_authorize_page(path) {
+                    armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                if is_login_page(path) {
+                    armed.store(true, std::sync::atomic::Ordering::SeqCst);
                     continue;
                 }
                 if !armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                    return; // 已被 on_navigation 那路接力
+                    continue; // 已被 on_navigation 那路接力
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1200)); // 留点时间让官网把回调收尾
                 flowlog::log(&fl, "zai-relay", &format!("poll {host}{} -> authorize", u.path()));
@@ -1028,14 +1046,18 @@ fn log_after_relay(app: AppHandle, flow: String, delay_ms: u64) {
     });
 }
 
-/// 登录 / 注册相关路径：说明还没登录完成，zai 接力不能在这些页面触发
+/// 登录 / 注册相关路径（含第三方入口与登录回调）：说明登录链路还没收尾，
+/// zai 接力不能在这些页面触发，否则会打断官网自己的回调跳转。
 fn is_login_page(path: &str) -> bool {
-    if path.starts_with("/login/callback") {
-        return false; // 登录回跳页：登录已完成
-    }
-    ["/auth", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/reset", "/forgot"]
+    ["/auth", "/login", "/signin", "/sign-in", "/signup", "/sign-up", "/register", "/reset", "/forgot", "/oauth"]
         .iter()
         .any(|p| path.starts_with(p))
+}
+
+/// 已在授权链路中（授权入口 / 授权确认页）：让页面自行走完，不能再接力，
+/// 否则会把正在进行的授权打断，被服务端弹回登录页。
+fn is_authorize_page(path: &str) -> bool {
+    path.ends_with("/oauth/authorize")
 }
 
 fn sweep_login_profiles(root: &std::path::Path) {

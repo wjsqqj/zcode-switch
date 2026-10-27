@@ -174,8 +174,6 @@ fn urlencode(s: &str) -> String {
 
 pub struct FlowInit {
     pub authorize_url: String,
-    /// 服务端原始 authorize_url（未经入口形态规范化）：已登录时直接发码，用于 zai 第二段接力
-    pub raw_authorize_url: String,
     pub state: String,
     pub poll_url: String,
     pub poll_token: String,
@@ -258,7 +256,6 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         .map_err(|_| invalid())?;
     Ok(FlowInit {
         authorize_url: auth_url.to_string(),
-        raw_authorize_url: authorize_raw.to_string(),
         state,
         poll_url: format!("{init_base}/api/v1/oauth/cli/poll/{}", urlencode(flow_id)),
         poll_token,
