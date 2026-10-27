@@ -26,35 +26,70 @@ const REDIRECT_ENC: &str = "zcode%3A%2F%2Foauth%2Fcallback";
 /// 登录成功后（回调 z.ai/login/callback）再接力到本次 flow 的 authorize_url 取码。
 pub const ZAI_LOGIN_ENTRY_URL: &str = "https://chat.z.ai/auth?response_type=code&client_id=client_lS94_Ka2ycE9IwCNYisudg&redirect_uri=https%3A%2F%2Fz.ai%2Flogin%2Fcallback%3Fredirect%3D%2525252Fmodel-api&state=1790259680634";
 
-/// z.ai 登录窗口内的辅助按钮条：一键切到官网「邮箱登录 / 邮箱注册」。
-/// zcode 的 API 授权 client 只放手机号登录，邮箱入口只在官网 client 登录页（ZAI_LOGIN_ENTRY_URL）才有；
-/// 被接力带到手机号页后点这两个按钮即可回到邮箱表单，找不到入口时先回官网页再自动点一次。
+/// z.ai 登录窗口内的辅助按钮条：手机号 / Google / GitHub / 邮箱登录 / 邮箱注册。
+/// 登录页把「邮箱表单」和「手机号表单」放在同一个页面上（手机号表单默认隐藏），所以按钮一律
+/// 先在页内找切换入口点一下；只有当前页确实没有可切入口、或人还停在 GitHub / Google 等第三方
+/// 域名时，才整页跳回 z.ai 入口，并用 sessionStorage 记住意图，落地后自动补点直到停在目标表单。
 const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
   var ENTRY = __ZSW_ENTRY__;
+  var PHONE_ENTRY = __ZSW_PHONE_ENTRY__;
+  var GOOGLE_ENTRY = 'https://chat.z.ai/oauth/google/login';
+  var GITHUB_ENTRY = 'https://chat.z.ai/oauth/github/login';
+  // 第三方域名（GitHub / Google 授权页）上不做任何页内文案猜测，按钮只能整页回 z.ai
+  var ZAI_HOST = /(^|\.)z\.ai$/i.test(location.hostname);
   var LBL = {
     login: __ZSW_LABEL_EMAIL_LOGIN__,
     signup: __ZSW_LABEL_EMAIL_SIGNUP__,
+    phone: __ZSW_LABEL_PHONE_LOGIN__,
+    google: __ZSW_LABEL_GOOGLE_LOGIN__,
+    github: __ZSW_LABEL_GITHUB_LOGIN__,
     already: __ZSW_LABEL_ALREADY__,
-    alreadySignup: __ZSW_LABEL_ALREADY_SIGNUP__
+    alreadySignup: __ZSW_LABEL_ALREADY_SIGNUP__,
+    alreadyPhone: __ZSW_LABEL_ALREADY_PHONE__
   };
-  // 登录表单和注册表单都有邮箱输入框，只能靠表单特征文案区分，不能只看 input[type=email]
+  // 登录 / 注册表单都有邮箱输入框，注册页只能靠表单特征文案区分（邮箱表单本身按输入框特征判）
   var PAGE = {
     email: ['邮箱登录', 'Email Login', 'Email login', 'Sign in with Email', 'Sign in with email'],
     signup: ['注册', 'Sign up', 'Sign Up', 'Register'],
     signupForm: ['创建账号', '已经拥有账号了？', 'Create account', 'Create Account', 'Already have an account'],
-    loginForm: ['忘记密码？', 'Forgot password', 'Forgot password?'],
     toLogin: ['登录', 'Sign in', 'Sign In']
   };
+  // 同页 tab / 链接的关键词（包含匹配，命中文案最短的元素，避免点到外层容器）
+  var KW = {
+    email: ['邮箱登录', '邮箱', '邮件', 'email', 'e-mail'],
+    phone: ['手机号登录', '手机号', '手机', 'phone', 'mobile', 'sms'],
+    signup: ['注册', '立即注册', 'sign up', 'signup', 'create account', 'register']
+  };
+  // 页内切换入口的候选元素：先只认交互元素（文案可长），再退到 tab 里的 li/span/div/label（文案必须很短）
+  var TOGGLE_SEL = ['button,a,[role="button"],[tabindex]', 'li,span,div,label'];
+  var TOGGLE_MAX = [24, 12];
   var INTENT_KEY = 'zsw_email_assist_intent';
   var BAR_ID = 'zsw-email-assist';
   var BTN_STYLE = 'cursor:pointer;border:1px solid rgba(255,255,255,.3);background:rgba(20,20,24,.88);color:#fff;border-radius:999px;padding:6px 12px;font:12px/1 system-ui,sans-serif;white-space:nowrap';
+  var norm = function (s) { return (s || '').replace(/\s+/g, '').toLowerCase(); };
+  var barEl = function () { return document.getElementById(BAR_ID); };
+  var inBar = function (el) { var b = barEl(); return !!(b && b.contains(el)); };
+  var clearFlag = function (key) { try { sessionStorage.removeItem(key); } catch (e) {} };
+  // 真实可见性：隐藏面板（零尺寸 / display:none / visibility:hidden / opacity:0）一律算不可见。
+  // 邮箱与手机号同页时，只有靠「当前可见的是哪个表单」才能区分用户此刻看到的是什么。
+  var visible = function (el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+    for (var p = el.parentElement; p; p = p.parentElement) {
+      var ps = window.getComputedStyle(p);
+      if (ps.display === 'none' || ps.visibility === 'hidden') return false;
+    }
+    return true;
+  };
   var findText = function (txt) {
-    var bar = document.getElementById(BAR_ID);
     var all = document.querySelectorAll('button,a');
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
-      if (bar && bar.contains(el)) continue;
-      if ((el.innerText || '').trim() === txt && el.offsetParent !== null) return el;
+      if (inBar(el)) continue;
+      if (norm(el.innerText) === norm(txt) && visible(el)) return el;
     }
     return null;
   };
@@ -65,8 +100,196 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
     }
     return null;
   };
+  // 第三方登录按钮文案不固定（Continue with Google 等），用包含匹配
+  var findContains = function (list) {
+    var all = document.querySelectorAll('button,a,[role="button"]');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (inBar(el) || !visible(el)) continue;
+      var txt = norm(el.innerText);
+      if (!txt || txt.length > 40) continue;
+      for (var j = 0; j < list.length; j++) {
+        if (txt.indexOf(norm(list[j])) >= 0) return el;
+      }
+    }
+    return null;
+  };
+  // 表单归属：按可见输入框的 type / placeholder / name / autocomplete 判断，比页面文案可靠
+  var inputKind = function (el) {
+    var hint = norm(
+      (el.getAttribute('type') || '') + ' ' +
+      (el.getAttribute('placeholder') || '') + ' ' +
+      (el.getAttribute('name') || '') + ' ' +
+      (el.getAttribute('autocomplete') || '') + ' ' +
+      (el.getAttribute('aria-label') || '')
+    );
+    if (hint.indexOf('email') >= 0 || hint.indexOf('邮箱') >= 0 || hint.indexOf('邮件') >= 0) return 'email';
+    if (hint.indexOf('tel') >= 0 || hint.indexOf('phone') >= 0 || hint.indexOf('mobile') >= 0 || hint.indexOf('手机') >= 0 || hint.indexOf('电话') >= 0) return 'phone';
+    return '';
+  };
+  var formShown = function (kind) {
+    var ins = document.querySelectorAll('input,textarea');
+    for (var i = 0; i < ins.length; i++) {
+      if (!visible(ins[i])) continue;
+      if (inputKind(ins[i]) === kind) return ins[i];
+    }
+    return null;
+  };
+  // 切换入口的可读文案：按钮文字 + aria-label / title + 图标 alt（纯图标 tab 也能命中）
+  var labelOf = function (el) {
+    var t = (el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '');
+    var icons = el.querySelectorAll ? el.querySelectorAll('img,svg,i') : [];
+    for (var i = 0; i < icons.length; i++) {
+      t += ' ' + (icons[i].getAttribute('alt') || '') + ' ' + (icons[i].getAttribute('aria-label') || '') + ' ' + (icons[i].getAttribute('title') || '');
+    }
+    return norm(t);
+  };
+  var pickByKeyword = function (sel, kws, maxLen) {
+    var all = document.querySelectorAll(sel);
+    var hit = null;
+    var best = 1e9;
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (inBar(el) || !visible(el)) continue;
+      if (el.querySelector && el.querySelector('input')) continue;
+      var txt = labelOf(el);
+      if (!txt || txt.length > maxLen) continue;
+      for (var j = 0; j < kws.length; j++) {
+        if (txt.indexOf(norm(kws[j])) >= 0) {
+          if (txt.length < best) { best = txt.length; hit = el; }
+          break;
+        }
+      }
+    }
+    return hit;
+  };
+  var findToggle = function (kind, pass) {
+    return pickByKeyword(TOGGLE_SEL[pass], KW[kind], TOGGLE_MAX[pass]);
+  };
+  var clickToggle = function (kind, pass) {
+    var el = findToggle(kind, pass);
+    if (!el) return false;
+    el.click();
+    return true;
+  };
+  // 手机号入口是快捷登录里第一个 Z.ai 图标按钮（无文字），用 Google 按钮的前一个兄弟定位
+  var clickZaiIcon = function () {
+    var google = document.querySelector('button[class*="ButtonContinueWithGoogle"]');
+    if (!google) return false;
+    var prev = google.previousElementSibling;
+    var btn = prev && prev.tagName === 'BUTTON' ? prev : (prev && prev.querySelector ? prev.querySelector('button') : null);
+    if (btn && btn !== google) { btn.click(); return true; }
+    var parent = google.parentElement;
+    if (parent) {
+      var first = parent.querySelector('button');
+      if (first && first !== google) { first.click(); return true; }
+    }
+    return false;
+  };
+  var PHONE_INTENT_KEY = 'zsw_phone_intent';
+  // 统一轮询：按名字去重（同一文档被多次注入也不会叠加多个轮询），fn 返回 true 即收工并释放名额
+  var poll = function (name, max, step, fn) {
+    var flag = '__zswPoll' + name;
+    try {
+      if (window[flag]) return;
+      window[flag] = true;
+    } catch (e) { return; }
+    var tries = 0;
+    var timer = setInterval(function () {
+      if (++tries > max) { clearInterval(timer); try { window[flag] = false; } catch (e) {} return; }
+      var done = false;
+      try { done = fn() === true; } catch (e) { done = true; }
+      if (done) { clearInterval(timer); try { window[flag] = false; } catch (e) {} }
+    }, step);
+  };
+  // 整页跳转是最后手段：落地后由 consume 自动补点到目标表单。
+  // 意图不能只存 sessionStorage：它按 origin 隔离，在 github.com 写的值跳到 chat.z.ai 就读不到。
+  // 所以同时用两个能跟着顶层跳转过境的载体：URL fragment（# 不发给服务端，不影响 OAuth 参数）
+  // 和 window.name（同一标签页内跨文档保留），落地后任一读到了就补点，并把两个都清掉。
+  var readName = function () {
+    var m = /^zsw-(phone|login|signup)$/.exec((function () { try { return window.name || ''; } catch (e) { return ''; } })());
+    return m ? m[1] : '';
+  };
+  var hashIntent = function () {
+    var m = (location.hash || '').match(/zsw-(phone|login|signup)/);
+    return m ? m[1] : '';
+  };
+  var goEntry = function (key, val, url, tag) {
+    if (ZAI_HOST) { try { sessionStorage.setItem(key, val); } catch (e) {} }
+    try { window.name = 'zsw-' + tag; } catch (e) {}
+    location.href = url.split('#')[0] + '#zsw-' + tag;
+  };
+  var adoptHashIntent = function () {
+    var k = hashIntent() || readName();
+    if (!k) return;
+    try { window.name = ''; } catch (e) {}
+    try {
+      sessionStorage.setItem(k === 'phone' ? PHONE_INTENT_KEY : INTENT_KEY, k === 'phone' ? '1' : k);
+      // 标记只认一次，用完就从地址栏抹掉，免得下次回到这一页重复切换表单
+      history.replaceState(null, '', location.pathname + location.search);
+    } catch (e) {}
+  };
+  // 第三方登录：优先点页面自身入口（参数 / state 由页面生成），再按类名定位，最后才回退固定地址
+  var clickProvider = function (words, sel, fallback) {
+    return function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      if (ZAI_HOST) {
+        var el = findContains(words);
+        if (!el) {
+          var byClass = document.querySelector(sel);
+          if (byClass && visible(byClass)) el = byClass;
+        }
+        if (el) { el.click(); return; }
+      }
+      location.href = fallback;
+    };
+  };
+  // 页内切到手机号表单：先认文字 tab，再认旧版 Z.ai 图标按钮，最后放宽到 li / span / div / label
+  var switchPhone = function () {
+    return clickToggle('phone', 0) || clickZaiIcon() || clickToggle('phone', 1);
+  };
+  var switchEmail = function () {
+    if (clickToggle('email', 0)) return true;
+    var btn = findAny(PAGE.email);
+    if (btn) { btn.click(); return true; }
+    return clickToggle('email', 1);
+  };
+  // 注册入口：文案精确命中优先，否则按关键词找；排除「注册协议」这类条款链接
+  var findSignup = function () {
+    var el = findAny(PAGE.signup) || findToggle('signup', 0);
+    if (el && /协议|条款|政策|term|privacy/.test(norm(el.innerText))) return null;
+    return el;
+  };
+  var startSignupClick = function () {
+    poll('signup', 20, 300, function () {
+      if (findAny(PAGE.signupForm)) return true;
+      var r = findSignup();
+      if (!r) return false;
+      r.click();
+      return true;
+    });
+  };
+  var openPhone = function (ev) {
+    ev.preventDefault(); ev.stopPropagation();
+    // 还停在 GitHub / Google 等第三方页：那里没有我们的表单，只能整页回 z.ai，意图靠 fragment 带过去
+    if (!ZAI_HOST) { goEntry(PHONE_INTENT_KEY, '1', PHONE_ENTRY, 'phone'); return; }
+    if (formShown('phone')) { hint(LBL.alreadyPhone); return; }
+    if (switchPhone()) return;
+    goEntry(PHONE_INTENT_KEY, '1', PHONE_ENTRY, 'phone');
+  };
+  var consumePhone = function () {
+    var intent;
+    try { intent = sessionStorage.getItem(PHONE_INTENT_KEY); } catch (e) { return; }
+    if (!intent) return;
+    poll('phone', 60, 300, function () {
+      if (!ZAI_HOST) { clearFlag(PHONE_INTENT_KEY); return true; }
+      if (formShown('phone')) { clearFlag(PHONE_INTENT_KEY); return true; }
+      switchPhone();
+      return false;
+    });
+  };
   var hint = function (msg) {
-    var bar = document.getElementById(BAR_ID);
+    var bar = barEl();
     var t = bar && bar.querySelector('[data-hint]');
     if (!t) return;
     t.textContent = msg;
@@ -74,47 +297,50 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
     setTimeout(function () { t.style.opacity = '0'; }, 1800);
   };
   var openEmail = function (signup) {
-    var onSignup = findAny(PAGE.signupForm);
-    var onLogin = findAny(PAGE.loginForm);
+    var tag = signup ? 'signup' : 'login';
+    if (!ZAI_HOST) { goEntry(INTENT_KEY, tag, ENTRY, tag); return; }
+    var emailShown = !!formShown('email');
+    var phoneShown = !!formShown('phone');
+    var onSignupForm = !!findAny(PAGE.signupForm);
     if (signup) {
-      if (onSignup) { hint(LBL.alreadySignup); return; }
-      var toSignup = onLogin ? findAny(PAGE.signup) : null;
+      if (onSignupForm && emailShown && !phoneShown) { hint(LBL.alreadySignup); return; }
+      var toSignup = findSignup();
       if (toSignup) { toSignup.click(); return; }
     } else {
-      if (onLogin) { hint(LBL.already); return; }
-      var toLogin = onSignup ? findAny(PAGE.toLogin) : null;
-      if (toLogin) { toLogin.click(); return; }
+      // 只有「邮箱表单可见 + 当前显示的不是手机号表单 + 不在注册页」才算已在邮箱登录页，
+      // 否则一律去点页内切换入口（旧版只靠文案特征，会在第三方页和同页手机号表单上误报）
+      if (emailShown && !phoneShown && !onSignupForm) { hint(LBL.already); return; }
+      if (onSignupForm) {
+        var toLogin = findAny(PAGE.toLogin);
+        if (toLogin) { toLogin.click(); return; }
+      }
     }
-    var btn = findAny(PAGE.email);
-    if (btn) {
-      btn.click();
-      if (signup) setTimeout(function () { var r = findAny(PAGE.signup); if (r) r.click(); }, 800);
+    if (switchEmail()) {
+      if (signup) startSignupClick();
       return;
     }
-    try { sessionStorage.setItem(INTENT_KEY, signup ? 'signup' : 'login'); } catch (e) {}
-    location.href = ENTRY;
+    goEntry(INTENT_KEY, tag, ENTRY, tag);
   };
   var consume = function () {
     var intent;
     try { intent = sessionStorage.getItem(INTENT_KEY); } catch (e) { return; }
     if (!intent) return;
-    var tries = 0;
-    var timer = setInterval(function () {
-      if (++tries > 40) { clearInterval(timer); return; }
-      var btn = findAny(PAGE.email);
-      if (!btn) return;
-      clearInterval(timer);
-      try { sessionStorage.removeItem(INTENT_KEY); } catch (e) {}
-      btn.click();
+    poll('email', 60, 300, function () {
+      if (!ZAI_HOST) { clearFlag(INTENT_KEY); return true; }
+      var done = false;
       if (intent === 'signup') {
-        var n = 0;
-        var t2 = setInterval(function () {
-          if (++n > 20) { clearInterval(t2); return; }
-          var r = findAny(PAGE.signup);
-          if (r) { clearInterval(t2); r.click(); }
-        }, 300);
+        if (findAny(PAGE.signupForm)) done = true;
+        else {
+          var r = findSignup();
+          if (r) { r.click(); done = true; } else switchEmail();
+        }
+      } else {
+        if (formShown('email')) done = true;
+        else done = switchEmail();
       }
-    }, 300);
+      if (done) clearFlag(INTENT_KEY);
+      return done;
+    });
   };
   var render = function () {
     if (document.getElementById(BAR_ID) || !document.body) return;
@@ -130,7 +356,18 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
       return b;
     };
     var wrap = document.createElement('div');
-    wrap.setAttribute('style', 'display:flex;gap:6px');
+    wrap.setAttribute('style', 'display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end');
+    var mkBtn = function (label, handler) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.setAttribute('style', BTN_STYLE);
+      b.addEventListener('click', handler);
+      return b;
+    };
+    wrap.appendChild(mkBtn(LBL.phone, openPhone));
+    wrap.appendChild(mkBtn(LBL.google, clickProvider(['google'], 'button[class*="ButtonContinueWithGoogle"]', GOOGLE_ENTRY)));
+    wrap.appendChild(mkBtn(LBL.github, clickProvider(['github'], 'button[class*="ButtonContinueWithGithub"]', GITHUB_ENTRY)));
     wrap.appendChild(mk(LBL.login, false));
     wrap.appendChild(mk(LBL.signup, true));
     var t = document.createElement('div');
@@ -142,48 +379,89 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
   };
   // 授权确认页自动点「授权」：第三方登录（Google / GitHub）回调后常停在这一页，
   // 按钮文案不固定，先按关键词找；找不到时若页面上只有一个可点按钮也点它（排除取消 / 返回 / 登录类）。
+  // 官网登录成功可能是 SPA 内部路由切到授权页（不再触发注入），所以这里常驻轮询而不是一次性判断。
   var autoAuthorize = function () {
-    if (location.pathname.indexOf('/oauth/authorize') < 0) return;
-    var tries = 0;
-    var timer = setInterval(function () {
-      if (++tries > 120) { clearInterval(timer); return; }
-      var bar = document.getElementById(BAR_ID);
+    poll('authorize', 600, 500, function () {
+      if (location.pathname.indexOf('/oauth/authorize') < 0) return false;
       var all = document.querySelectorAll('button,a,[role="button"]');
       var others = [];
       var hit = null;
       for (var i = 0; i < all.length; i++) {
         var el = all[i];
-        if ((bar && bar.contains(el)) || el.offsetParent === null) continue;
+        if (inBar(el) || !visible(el)) continue;
         var raw = (el.innerText || '').trim();
-        var txt = raw.toLowerCase();
+        var txt = norm(raw);
         if (!raw || raw.length > 24) continue;
         if (/cancel|deny|拒绝|取消|返回|back|login|sign|登录/.test(txt)) continue;
         if (/授权|同意|允许|authorize|allow|agree|continue|确认|继续/.test(txt)) { hit = el; break; }
         others.push(el);
       }
       var btn = hit || (others.length === 1 ? others[0] : null);
-      if (!btn) return;
-      clearInterval(timer);
+      if (!btn) return false;
       btn.click();
-    }, 500);
+      return true;
+    });
   };
   var bootTries = 0;
+  // 注入会被反复触发（on_page_load + 窗口起来后的补注入），render 靠 BAR_ID 幂等，
+  // 各路轮询靠 poll 里的 window 标记去重，所以每次注入都可以直接再调一遍。
   var boot = function () {
-    if (document.body) { render(); consume(); autoAuthorize(); return; }
+    if (document.body) { adoptHashIntent(); render(); consume(); consumePhone(); autoAuthorize(); return; }
     if (++bootTries > 50) return;
     setTimeout(boot, 100);
   };
   boot();
 })();"##;
 
-pub fn zai_email_assist_script() -> String {
+pub fn zai_email_assist_script(phone_entry: &str) -> String {
     let lit = |s: String| serde_json::Value::String(s).to_string();
     ZAI_EMAIL_ASSIST_JS
+        .replace("__ZSW_PHONE_ENTRY__", &lit(phone_entry.to_string()))
         .replace("__ZSW_ENTRY__", &lit(ZAI_LOGIN_ENTRY_URL.to_string()))
         .replace("__ZSW_LABEL_EMAIL_LOGIN__", &lit(crate::i18n::tr("login.assist.email")))
+        .replace("__ZSW_LABEL_PHONE_LOGIN__", &lit(crate::i18n::tr("login.assist.phone")))
+        .replace("__ZSW_LABEL_GOOGLE_LOGIN__", &lit(crate::i18n::tr("login.assist.google")))
+        .replace("__ZSW_LABEL_GITHUB_LOGIN__", &lit(crate::i18n::tr("login.assist.github")))
         .replace("__ZSW_LABEL_EMAIL_SIGNUP__", &lit(crate::i18n::tr("login.assist.signup")))
         .replace("__ZSW_LABEL_ALREADY__", &lit(crate::i18n::tr("login.assist.hint")))
         .replace("__ZSW_LABEL_ALREADY_SIGNUP__", &lit(crate::i18n::tr("login.assist.hint_signup")))
+        .replace("__ZSW_LABEL_ALREADY_PHONE__", &lit(crate::i18n::tr("login.assist.hint_phone")))
+}
+
+#[cfg(test)]
+mod assist_tests {
+    use super::zai_email_assist_script;
+    use crate::i18n::{tr_lang, Lang};
+
+    /// 注入脚本的占位符必须全部替换掉，且按钮 / 提示文案在中英文表里都齐备
+    /// （tr_lang 未命中会原样返回 key，英文表缺 key 时会回退成中文，所以再按 ASCII 方向校一次）。
+    #[test]
+    fn assist_script_placeholders_and_labels() {
+        const KEYS: [&str; 8] = [
+            "login.assist.email",
+            "login.assist.phone",
+            "login.assist.google",
+            "login.assist.github",
+            "login.assist.signup",
+            "login.assist.hint",
+            "login.assist.hint_signup",
+            "login.assist.hint_phone",
+        ];
+        for lang in [Lang::Zh, Lang::En] {
+            for key in KEYS {
+                let v = tr_lang(lang, key);
+                assert_ne!(v, key, "{lang:?} 缺少文案 {key}");
+                assert!(!v.is_empty(), "{lang:?} 文案 {key} 为空");
+                assert_eq!(v.is_ascii(), lang == Lang::En, "{key} 的 {lang:?} 文案不对：{v}");
+            }
+            let js = zai_email_assist_script("https://chat.z.ai/auth?x=1");
+            assert!(!js.contains("__ZSW_"), "{lang:?} 注入脚本有未替换的占位符");
+            // 同页表单判定 / 第三方域名收敛 / 页内切换 / 去重轮询，缺一个就是本次改动回归
+            for token in ["ZAI_HOST", "formShown", "switchPhone", "switchEmail", "poll("] {
+                assert!(js.contains(token), "{lang:?} 注入脚本缺少 {token}");
+            }
+        }
+    }
 }
 
 pub fn bridge_redirect_uri() -> String {

@@ -878,10 +878,10 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     if let Some(u) = proxy_url {
         builder = builder.proxy_url(u);
     }
-    // z.ai：官网登录页有邮箱入口，但 API 授权 client 的兜底页只放手机号；
+    // z.ai：邮箱 / 手机号两个表单在同一个登录页上（手机号默认隐藏），页内切换优先，
     // 页面每次加载后注入按钮条，用户随时可切回邮箱登录 / 邮箱注册
     if provider == "zai" {
-        let assist = oauth::zai_email_assist_script();
+        let assist = oauth::zai_email_assist_script(&init.authorize_url);
         let assist_load = assist.clone();
         let flow_load = flow.clone();
         builder = builder.on_page_load(move |wv, payload| {
