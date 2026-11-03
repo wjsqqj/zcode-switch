@@ -7,6 +7,8 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+// 非 macOS 目标只反序列化不读取字段（glass_sync 直接跳过），避免 dead_code 告警
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct GlassPane {
     pub id: String,
     /// WebView 内 CSS 像素（左上原点，等于 AppKit points）
@@ -22,6 +24,8 @@ pub struct GlassPane {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// 非 macOS 目标只反序列化不收字段（glass_sync 直接跳过），避免 dead_code 告警
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct GlassFrame {
     pub panes: Vec<GlassPane>,
     /// 底色 `#rrggbb`，与前端 `--glass-base` 一致
