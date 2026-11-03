@@ -2327,6 +2327,7 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-quartz-core",
 ]
 
 [[package]]
@@ -2454,6 +2455,7 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation",
 ]
 
@@ -5585,6 +5587,11 @@ dependencies = [
  "chrono",
  "iana-time-zone",
  "native-tls",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-quartz-core",
  "pbkdf2",
  "serde",
  "serde_json",

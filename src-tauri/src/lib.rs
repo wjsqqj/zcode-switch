@@ -4,6 +4,7 @@ pub mod i18n;
 pub mod changelog;
 pub mod claim;
 mod flowlog;
+mod glass;
 mod oauth;
 mod probe;
 mod quota;
@@ -1510,21 +1511,29 @@ async fn open_settings(app: AppHandle) -> Result<(), String> {
         let _ = win.set_focus();
         return Ok(());
     }
-    let win = tauri::WebviewWindowBuilder::new(
+    let builder = tauri::WebviewWindowBuilder::new(
         &app,
         "settings",
         tauri::WebviewUrl::App("settings.html".into()),
     )
     .title(i18n::tr("title.settings"))
-    .theme(Some(tauri::Theme::Dark))
-    .background_color(tauri::window::Color(10, 10, 12, 255))
     .inner_size(w, h)
     .min_inner_size(440.0, 540.0)
     .resizable(true)
     .additional_browser_args("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server")
-    .visible(false)
-    .build()
-    .map_err(|e| e.to_string())?;
+    .visible(false);
+    // macOS：透明窗口 + 覆盖式标题栏，整窗外框由原生玻璃提供（glass.rs），外观跟随系统
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .transparent(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .traffic_light_position(tauri::LogicalPosition::new(20.0, 20.0));
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder
+        .theme(Some(tauri::Theme::Dark))
+        .background_color(tauri::window::Color(10, 10, 12, 255));
+    let win = builder.build().map_err(|e| e.to_string())?;
+    glass::install(&win);
     center_over_main(&app, &win, w, h);
     let _ = win.show();
     let _ = win.set_focus();
@@ -1783,6 +1792,7 @@ pub fn run() {
             open_external,
             open_settings,
             reveal_main,
+            glass::glass_sync,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1796,6 +1806,9 @@ pub fn run() {
                 if window.label() == "captcha" {
                     *pending_guard() = None;
                 }
+            }
+            if let tauri::WindowEvent::Destroyed = event {
+                glass::forget(window.app_handle(), window.label());
             }
         })
         .setup(|app| {
@@ -1814,6 +1827,12 @@ pub fn run() {
                         changelog::refresh_cache(&home);
                     }
                 });
+            }
+            // macOS 主窗以隐藏、透明创建（tauri.macos.conf.json）：先铺原生底色再显示，避免首帧露出桌面
+            if let Some(main) = app.get_webview_window("main") {
+                glass::install(&main);
+                #[cfg(target_os = "macos")]
+                let _ = main.show();
             }
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())

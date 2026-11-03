@@ -1,0 +1,852 @@
+/* macOS 设计层：只在 html.mac 下生效（index.html / settings.html 首帧前打类），Windows / Linux 保持原样。
+ *
+ * 原生玻璃在 WKWebView 下方（src-tauri/src/glass.rs）。窗口背景、侧栏、工具栏胶囊以及它们上方的每一层
+ * 都不能绘制底色：窗口底色由原生底色层提供，色值就是 --glass-base（与 glass.rs 的 BASE_* 一致）。
+ * 浮在内容上方的弹层、卡片和提示改用玻璃的实体形态：不透明材质色 + Tahoe 几何（加倍的同心圆角、
+ * 内缘高光、细外缘、柔和的深阴影），不用半透明填充或模糊冒充玻璃。
+ */
+
+html.mac {
+  color-scheme: light dark;
+
+  --glass-base: #1c1c1f;
+
+  --label: rgba(255, 255, 255, .9);
+  --label-2: rgba(235, 235, 245, .64);
+  --label-3: rgba(235, 235, 245, .4);
+  --fill: rgba(255, 255, 255, .06);
+  --fill-2: rgba(255, 255, 255, .1);
+  --fill-3: rgba(255, 255, 255, .16);
+  --separator: rgba(255, 255, 255, .08);
+
+  --card: #28282c;
+  --card-edge: rgba(255, 255, 255, .075);
+  --card-hi: rgba(255, 255, 255, .05);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .3);
+
+  --solid: #2c2c31;
+  --solid-edge: rgba(255, 255, 255, .12);
+  --solid-hi: rgba(255, 255, 255, .09);
+  --shadow-deep: 0 24px 64px rgba(0, 0, 0, .5), 0 4px 16px rgba(0, 0, 0, .3);
+  --mask: rgba(0, 0, 0, .4);
+
+  --group: rgba(255, 255, 255, .055);
+  --group-edge: rgba(255, 255, 255, .06);
+  --group-hi: rgba(255, 255, 255, .04);
+  --field: rgba(0, 0, 0, .25);
+  --field-edge: rgba(255, 255, 255, .1);
+  --seg-on: rgba(255, 255, 255, .22);
+  --knob: #f5f5f7;
+
+  --accent: #ff9f0a;
+  --accent-fill: #ff9f0a;
+  --accent-ink: #231500;
+  --accent-text: #ffb340;
+  --accent-soft: rgba(255, 159, 10, .16);
+  --accent-ring: rgba(255, 159, 10, .5);
+  --green: #30d158;
+  --green-text: #4cd964;
+  --green-soft: rgba(48, 209, 88, .16);
+  --green-ring: rgba(48, 209, 88, .5);
+  --red: #ff453a;
+  --red-text: #ff6961;
+  --red-soft: rgba(255, 69, 58, .16);
+  --blue-text: #409cff;
+  --blue-soft: rgba(10, 132, 255, .18);
+  --purple-text: #da8fff;
+  --purple-soft: rgba(191, 90, 242, .18);
+
+  /* 原样式的令牌映射到系统色：没有单独覆盖的规则也跟随明暗外观 */
+  --bg: var(--glass-base);
+  --bg-2: var(--fill);
+  --panel: var(--card);
+  --panel-2: var(--card);
+  --hairline: var(--card-edge);
+  --hairline-soft: var(--separator);
+  --ink: var(--label);
+  --ink-dim: var(--label-2);
+  --ink-mute: var(--label-3);
+  --amber: var(--accent);
+  --amber-deep: var(--accent);
+  --amber-ink: var(--accent-ink);
+  --mint: var(--green);
+  --mint-dim: var(--green-ring);
+  --red-dim: var(--red-soft);
+  --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  --body: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  html.mac {
+    --glass-base: #efeff2;
+
+    --label: rgba(0, 0, 0, .86);
+    --label-2: rgba(60, 60, 67, .72);
+    --label-3: rgba(60, 60, 67, .46);
+    --fill: rgba(0, 0, 0, .04);
+    --fill-2: rgba(0, 0, 0, .07);
+    --fill-3: rgba(0, 0, 0, .11);
+    --separator: rgba(0, 0, 0, .08);
+
+    --card: #ffffff;
+    --card-edge: rgba(0, 0, 0, .07);
+    --card-hi: rgba(255, 255, 255, 1);
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, .05), 0 2px 8px rgba(0, 0, 0, .03);
+
+    --solid: #fbfbfd;
+    --solid-edge: rgba(0, 0, 0, .1);
+    --solid-hi: rgba(255, 255, 255, .95);
+    --shadow-deep: 0 24px 64px rgba(0, 0, 0, .2), 0 4px 16px rgba(0, 0, 0, .1);
+    --mask: rgba(0, 0, 0, .18);
+
+    --group: rgba(255, 255, 255, .62);
+    --group-edge: rgba(0, 0, 0, .05);
+    --group-hi: rgba(255, 255, 255, .7);
+    --field: rgba(255, 255, 255, .92);
+    --field-edge: rgba(0, 0, 0, .12);
+    --seg-on: #ffffff;
+    --knob: #ffffff;
+
+    --accent: #ff9500;
+    --accent-fill: #f28a00;
+    --accent-ink: #ffffff;
+    --accent-text: #c45c00;
+    --accent-soft: rgba(255, 149, 0, .14);
+    --accent-ring: rgba(255, 149, 0, .55);
+    --green: #34c759;
+    --green-text: #1f8a3c;
+    --green-soft: rgba(52, 199, 89, .15);
+    --green-ring: rgba(52, 199, 89, .55);
+    --red: #ff3b30;
+    --red-text: #d70015;
+    --red-soft: rgba(255, 59, 48, .12);
+    --blue-text: #0062cc;
+    --blue-soft: rgba(0, 122, 255, .12);
+    --purple-text: #8944ab;
+    --purple-soft: rgba(175, 82, 222, .13);
+  }
+}
+
+/* ── 基础 ─────────────────────────────────────────────── */
+
+html.mac,
+html.mac body {
+  background: transparent !important;
+}
+html.mac body {
+  font-family: var(--body);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--label);
+}
+html.mac #splash { background: var(--glass-base) !important; }
+html.mac button { font-family: var(--body); font-size: 13px; }
+
+html.mac button:focus-visible,
+html.mac input:focus-visible,
+html.mac .row-actions a:focus-visible {
+  outline: 3px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+
+html.mac .ver {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .04em;
+  color: var(--label-3);
+}
+html.mac .loading {
+  font-family: var(--body);
+  font-size: 12px;
+  letter-spacing: .14em;
+  color: var(--label-3);
+}
+
+/* 通用按钮：Tahoe 胶囊 */
+html.mac .btn-ghost {
+  height: 28px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--fill-2);
+  color: var(--label);
+  font-size: 13px;
+  font-weight: 500;
+}
+html.mac .btn-ghost:hover:not(:disabled) { background: var(--fill-3); color: var(--label); }
+html.mac .btn-primary {
+  height: 28px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent-fill);
+  color: var(--accent-ink);
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22), 0 1px 2px rgba(0, 0, 0, .18);
+}
+html.mac .btn-primary:hover:not(:disabled) { background: var(--accent-fill); filter: brightness(1.06); }
+html.mac .btn-primary.attention { box-shadow: 0 0 0 3px var(--accent-soft), inset 0 1px 0 rgba(255, 255, 255, .22); }
+html.mac .btn-mini {
+  border: 0;
+  border-radius: 999px;
+  background: var(--fill-2);
+  color: var(--label);
+  font-size: 11.5px;
+  padding: 2px 10px;
+}
+html.mac .btn-mini:hover { background: var(--fill-3); color: var(--label); }
+
+/* macOS 开关 */
+html.mac .toggle {
+  width: 38px;
+  height: 22px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--fill-3);
+  transition: background .2s ease;
+}
+html.mac .toggle .knob {
+  left: 2px;
+  top: 2px;
+  width: 18px;
+  height: 18px;
+  background: var(--knob);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3), 0 0 0 .5px rgba(0, 0, 0, .08);
+  transition: transform .2s cubic-bezier(.3, .7, .4, 1);
+}
+html.mac .toggle.on { background: var(--accent-fill); border: 0; }
+html.mac .toggle.on .knob { transform: translateX(16px); background: var(--knob); }
+
+/* 分段控件 */
+html.mac .lang-seg {
+  gap: 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--fill-2);
+}
+html.mac .lang-opt {
+  padding: 2px 14px;
+  border-radius: 6px;
+  color: var(--label);
+  font-size: 12px;
+  font-weight: 500;
+}
+html.mac .lang-opt:hover { color: var(--label); }
+html.mac .lang-opt.on {
+  background: var(--seg-on);
+  color: var(--label);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .16), 0 0 0 .5px rgba(0, 0, 0, .05);
+}
+
+/* ── 主窗：玻璃侧栏 + 内容区 ─────────────────────────── */
+
+html.mac body:not(.settings-win) #app { flex-direction: row; }
+
+/* 侧栏：下方是取样桌面的原生玻璃（底色层在此镂空），这里不绘制任何底色 */
+html.mac .sidebar {
+  flex: none;
+  width: 236px;
+  margin: 8px 0 8px 8px;
+  padding: 0 10px 10px;
+  border-radius: 18px;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+html.mac .sb-head { padding: 50px 10px 10px; }
+html.mac .sb-brand { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+html.mac .sidebar .wordmark {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: .16em;
+  color: var(--label);
+}
+html.mac .sidebar .wordmark .tick { color: var(--accent); }
+html.mac .sidebar .top-status {
+  display: inline-flex;
+  margin-top: 10px;
+  padding: 3px 10px 3px 8px;
+  border-radius: 999px;
+  background: var(--fill);
+  font-size: 12px;
+  color: var(--label-2);
+  gap: 6px;
+}
+html.mac .top-status.unsaved .status-text { color: var(--accent-text); }
+html.mac .status-dot { width: 7px; height: 7px; box-shadow: none; background: var(--green); }
+html.mac .status-dot.run { background: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
+html.mac .status-dot.off { background: var(--label-3); }
+
+html.mac .sb-nav {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 0;
+}
+html.mac .sb-label {
+  padding: 10px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--label-3);
+}
+
+/* 侧栏项：前景色低透明度做悬停/按下态，图标用强调色 */
+html.mac .sidebar .btn-ghost,
+html.mac .sidebar .btn-primary,
+html.mac .sidebar .tog-inline {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: none;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--label);
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  box-shadow: none;
+  filter: none;
+}
+html.mac .sidebar .btn-ghost .ic,
+html.mac .sidebar .btn-primary .ic { color: var(--accent-text); }
+html.mac .sidebar .btn-ghost:hover:not(:disabled),
+html.mac .sidebar .btn-primary:hover:not(:disabled),
+html.mac .sidebar .tog-inline:hover { background: var(--fill-2); color: var(--label); }
+html.mac .sidebar .btn-ghost:active:not(:disabled),
+html.mac .sidebar .tog-inline:active { background: var(--fill-3); }
+html.mac .sidebar .claim-all { color: var(--accent-text); }
+
+/* “保存当前登录”可用时是侧栏里唯一的实心按钮 */
+html.mac .sidebar .btn-primary:not(:disabled) {
+  margin-bottom: 4px;
+  background: var(--accent-fill);
+  color: var(--accent-ink);
+  font-weight: 600;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .24), 0 1px 3px rgba(0, 0, 0, .2);
+}
+html.mac .sidebar .btn-primary:not(:disabled) .ic { color: currentColor; }
+html.mac .sidebar .btn-primary:not(:disabled):hover { background: var(--accent-fill); filter: brightness(1.06); }
+html.mac .sidebar .btn-primary.attention { box-shadow: 0 0 0 3px var(--accent-soft), inset 0 1px 0 rgba(255, 255, 255, .24); }
+
+html.mac .sb-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 8px;
+  border-top: .5px solid var(--separator);
+}
+html.mac .sidebar .tog-inline { flex-direction: row-reverse; justify-content: space-between; }
+html.mac .sidebar .tog-inline.on { color: var(--label); border: 0; box-shadow: none; }
+html.mac .sidebar .tog-inline.running { animation: none; color: var(--accent-text); }
+html.mac .tog-inline .toggle { width: 32px; height: 19px; }
+html.mac .tog-inline .toggle .knob { width: 15px; height: 15px; }
+html.mac .tog-inline .toggle.on .knob { transform: translateX(13px); }
+html.mac .tog-inline.on .toggle { background: var(--accent-fill); }
+
+html.mac .content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+html.mac .content-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 62px;
+  padding: 12px 20px 8px 26px;
+}
+html.mac .ch-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+html.mac .ch-title h1 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -.01em;
+  color: var(--label);
+  white-space: nowrap;
+}
+html.mac .ch-title .count {
+  font-size: 12px;
+  color: var(--label-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 工具栏胶囊：下方是取样窗口底色的原生玻璃 */
+html.mac .tb-capsule {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  padding: 4px;
+  border-radius: 999px;
+  background: transparent;
+}
+html.mac .tb-capsule .btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px;
+  background: transparent;
+  white-space: nowrap;
+}
+html.mac .tb-capsule .btn-ghost:hover:not(:disabled) { background: var(--fill-2); }
+html.mac .tb-capsule .btn-ghost:active:not(:disabled) { background: var(--fill-3); }
+html.mac .tb-capsule .btn-ghost .ic { color: var(--accent-text); }
+
+html.mac .list { padding: 4px 20px 22px 20px; }
+
+/* ── 账号卡片（实体形态） ─────────────────────────────── */
+
+html.mac .row {
+  margin-bottom: 10px;
+  padding: 13px 14px 12px 34px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--card);
+  box-shadow: 0 0 0 .5px var(--card-edge), inset 0 1px 0 var(--card-hi), var(--shadow-card);
+}
+html.mac .row:hover,
+html.mac .row:focus-within { background: var(--card); border: 0; }
+html.mac .row.active {
+  background: var(--card);
+  box-shadow: 0 0 0 1.5px var(--green-ring), inset 0 1px 0 var(--card-hi), var(--shadow-card);
+}
+html.mac .row.force {
+  background: var(--card);
+  box-shadow: 0 0 0 1.5px var(--accent-ring), inset 0 1px 0 var(--card-hi), var(--shadow-card);
+}
+html.mac .notch {
+  left: 14px;
+  top: 21px;
+  bottom: auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+html.mac .row-name { gap: 6px; font-size: 15px; font-weight: 600; color: var(--label); }
+html.mac .row-meta {
+  margin-top: 2px;
+  font-family: var(--body);
+  font-size: 12px;
+  letter-spacing: 0;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+html.mac .no-cfg { color: var(--accent-text); }
+html.mac .warn-line { color: var(--accent-text) !important; }
+
+html.mac .tag-use,
+html.mac .tag-relogin,
+html.mac .tier-b {
+  font-family: var(--body);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  line-height: 17px;
+  padding: 0 7px;
+  border: 0 !important;
+  border-radius: 999px;
+}
+html.mac .tag-use { color: var(--green-text); background: var(--green-soft); }
+html.mac .tag-relogin { color: var(--accent-text); background: var(--accent-soft); }
+html.mac .tier-b { font-weight: 700; }
+html.mac .tier-b.max { color: var(--accent-text); background: var(--accent-soft); }
+html.mac .tier-b.pro { color: var(--blue-text); background: var(--blue-soft); }
+html.mac .tier-b.lite { color: var(--green-text); background: var(--green-soft); }
+html.mac .tier-b.trial { color: var(--purple-text); background: var(--purple-soft); }
+html.mac .tier-b.free,
+html.mac .tier-b.other { color: var(--label-2); background: var(--fill-2); }
+html.mac .tier {
+  font-family: var(--body);
+  font-size: 11px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0 8px;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+html.mac .row-actions { gap: 2px; }
+html.mac .icon-btn {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--label-2);
+}
+html.mac .icon-btn:hover { border: 0; background: var(--fill-2); color: var(--label); }
+html.mac .icon-btn:active { background: var(--fill-3); }
+html.mac .icon-btn.danger:hover { color: var(--red-text); background: var(--red-soft); }
+html.mac .ic-badge {
+  right: -2px;
+  bottom: -2px;
+  background: var(--accent-fill);
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+html.mac .btn-switch {
+  gap: 5px;
+  height: 28px;
+  margin-left: 6px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+html.mac .btn-switch:hover:not(:disabled) { background: var(--accent-fill); color: var(--accent-ink); }
+html.mac .btn-switch:disabled { opacity: 1; background: var(--fill); color: var(--label-3); cursor: default; }
+
+html.mac .row .rename-input {
+  font-size: 15px;
+  color: var(--label);
+  background: var(--field);
+  border: .5px solid var(--accent);
+  border-radius: 7px;
+  padding: 2px 8px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+html.mac .row .rename-input:focus { border-color: var(--accent); }
+html.mac .row-actions .btn-ghost { height: 26px; }
+
+html.mac .confirm-box { gap: 6px; font-size: 13px; color: var(--label-2); }
+html.mac .confirm-box button {
+  padding: 3px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--fill-2);
+  color: var(--label);
+}
+html.mac .confirm-box .yes { background: var(--red-soft); color: var(--red-text); }
+html.mac .confirm-box .yes:hover { background: var(--red-soft); filter: brightness(1.15); }
+html.mac .confirm-box .go { background: var(--accent-soft); color: var(--accent-text); }
+html.mac .confirm-box .go:hover { background: var(--accent-soft); filter: brightness(1.15); }
+html.mac .confirm-box .no:hover { background: var(--fill-3); color: var(--label); }
+
+html.mac .empty {
+  padding: 44px 20px;
+  border: 1.5px dashed var(--fill-3);
+  border-radius: 18px;
+  color: var(--label-2);
+  font-size: 13px;
+}
+html.mac .empty .glyph { color: var(--label-3); }
+html.mac .empty b { color: var(--label); }
+
+/* 额度：细进度条，百分比放在条外 */
+html.mac .row-quota-slot {
+  gap: 6px;
+  min-height: 0;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: .5px solid var(--separator);
+}
+html.mac .row-quota-slot:empty { display: none; }
+html.mac .q-win,
+html.mac .q-win.mini {
+  grid-template-columns: 64px 1fr 132px;
+  gap: 10px;
+  margin-bottom: 0;
+}
+html.mac .q-win + .q-win { margin-top: 4px; }
+html.mac .q-win-label,
+html.mac .q-win.mini .q-win-label { font-size: 12px; color: var(--label-2); }
+html.mac .q-win-reset,
+html.mac .q-win.mini .q-win-reset {
+  font-family: var(--body);
+  font-size: 11px;
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+html.mac .q-win-pct { font-family: var(--body); font-variant-numeric: tabular-nums; }
+html.mac .qbar,
+html.mac .q-win.mini .qbar {
+  height: 6px;
+  margin: 0 42px 0 0;
+  border-radius: 999px;
+  background: var(--fill-2);
+  overflow: visible;
+}
+html.mac .qbar-fill { border-radius: 999px; background: var(--green); }
+html.mac .qbar.warn .qbar-fill { background: var(--accent); }
+html.mac .qbar.danger .qbar-fill { background: var(--red); }
+html.mac .qbar-pct,
+html.mac .qbar-pct.in-fill,
+html.mac .q-win.mini .qbar-pct {
+  inset: auto;
+  left: calc(100% + 6px);
+  top: 50%;
+  width: 36px;
+  transform: translateY(-50%);
+  justify-content: flex-end;
+  font-family: var(--body);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+html.mac .plan-grp + .plan-grp {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: .5px solid var(--separator);
+}
+html.mac .pg-head { gap: 6px; margin-bottom: 5px; }
+html.mac .pg-name {
+  font-family: var(--body);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--label);
+}
+html.mac .pg-exp {
+  font-family: var(--body);
+  font-size: 11px;
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+html.mac .q-bonus-hint,
+html.mac .q-line,
+html.mac .q-item-nums { color: var(--label-3); }
+html.mac .aq-loading,
+html.mac .q-loading { color: var(--label-3); font-size: 12px; }
+html.mac .aq-err,
+html.mac .q-err,
+html.mac .q-err-mini { color: var(--red-text); }
+html.mac .q-month-detail,
+html.mac .q-items { border-top: .5px solid var(--separator); }
+
+/* 活动领取条 */
+html.mac .claim-strip {
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 6px 6px 6px 11px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 12px;
+}
+html.mac .claim-grants { color: var(--label-2); }
+html.mac .btn-claim {
+  height: 24px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent-fill);
+  color: var(--accent-ink);
+  font-size: 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22);
+}
+html.mac .btn-claim:hover { background: var(--accent-fill); filter: brightness(1.06); }
+html.mac .claim-strip.claimed { background: var(--green-soft); color: var(--green-text); border: 0; }
+html.mac .claim-strip.history { opacity: .6; border: 0; }
+
+/* ── 浮层：玻璃的实体形态 ─────────────────────────────── */
+
+html.mac .cm-mask,
+html.mac .pw-mask,
+html.mac .pv-mask,
+html.mac .act-mask {
+  background: var(--mask);
+  backdrop-filter: none;
+}
+html.mac .cm-panel,
+html.mac .pw-panel,
+html.mac .pv-panel,
+html.mac .act-panel {
+  padding: 22px 22px 18px;
+  border: 0;
+  border-radius: 26px;
+  background: var(--solid);
+  box-shadow: 0 0 0 .5px var(--solid-edge), inset 0 1px 0 var(--solid-hi), var(--shadow-deep);
+}
+html.mac .cm-strip { display: none; }
+html.mac .cm-title,
+html.mac .pw-title,
+html.mac .pv-title,
+html.mac .act-title { font-size: 15px; font-weight: 700; color: var(--label); }
+html.mac .cm-desc,
+html.mac .pw-sub,
+html.mac .pv-sub { font-size: 12.5px; line-height: 1.6; color: var(--label-2); }
+html.mac .cm-desc b,
+html.mac .pw-sub b,
+html.mac .pv-sub b { color: var(--accent-text); }
+html.mac .cm-ic.danger { color: var(--red); }
+html.mac .cm-ic.warn,
+html.mac .cm-ic.plain { color: var(--accent); }
+html.mac .cm-actions .btn-ghost,
+html.mac .pw-actions .btn-ghost,
+html.mac .pv-actions .btn-ghost,
+html.mac .act-actions-row .btn-ghost { height: 30px; padding: 0 16px; }
+html.mac .cm-yes {
+  height: 30px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 999px;
+  font-size: 13px;
+}
+html.mac .cm-yes.danger { background: var(--red); color: #fff; border: 0; }
+html.mac .cm-yes.danger:hover:not(:disabled) { background: var(--red); filter: brightness(1.08); }
+html.mac .cm-yes.warn,
+html.mac .cm-yes.plain { background: var(--accent-fill); color: var(--accent-ink); border: 0; }
+html.mac .cm-yes.warn:hover:not(:disabled),
+html.mac .cm-yes.plain:hover:not(:disabled) { background: var(--accent-fill); filter: brightness(1.06); }
+html.mac .pw-actions .pw-go { height: 30px; padding: 0 18px; }
+html.mac .pw-input {
+  height: 32px;
+  padding: 0 11px;
+  font-size: 13px;
+  color: var(--label);
+  background: var(--field);
+  border: .5px solid var(--field-edge);
+  border-radius: 9px;
+}
+html.mac .pw-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+html.mac .pw-err { font-size: 12px; color: var(--red-text); }
+html.mac .pv-item {
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--fill);
+  font-size: 13px;
+  color: var(--label);
+}
+html.mac .pv-item:hover { background: var(--accent-soft); border: 0; }
+html.mac .act-item { border: 0; border-radius: 14px; background: var(--fill); }
+html.mac .act-item summary { font-size: 13px; }
+html.mac .act-item .act-acct,
+html.mac .act-item .act-time { color: var(--label-2); }
+html.mac .act-group-head { font-size: 11px; letter-spacing: .04em; color: var(--label-3); }
+html.mac .act-body { font-size: 12px; }
+html.mac .act-kv b { color: var(--label-2); }
+html.mac .act-copy { border-radius: 10px; background: var(--fill); color: var(--label-2); }
+html.mac .act-empty { color: var(--label-3); }
+
+html.mac .toast-zone { bottom: 26px; }
+html.mac body:not(.settings-win) .toast-zone { left: calc(50% + 122px); }
+html.mac .toast {
+  gap: 9px;
+  padding: 10px 16px 10px 12px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--solid);
+  color: var(--label);
+  font-size: 13px;
+  box-shadow: 0 0 0 .5px var(--solid-edge), inset 0 1px 0 var(--solid-hi), var(--shadow-deep);
+}
+html.mac .toast.err { color: var(--label); }
+html.mac .toast .detail,
+html.mac .toast.err .detail { font-size: 12px; color: var(--label-2); }
+html.mac .toast .t-ic { margin-top: 1px; }
+html.mac .toast.ok .t-ic { color: var(--green); }
+html.mac .toast.err .t-ic { color: var(--red); }
+html.mac .toast.warn .t-ic { color: var(--accent); }
+
+html.mac .act-toast {
+  border: 0;
+  border-radius: 14px;
+  background: var(--solid);
+  color: var(--accent-text);
+  box-shadow: 0 0 0 .5px var(--solid-edge), inset 0 1px 0 var(--solid-hi), var(--shadow-deep);
+}
+html.mac .act-toast:hover { background: var(--solid); filter: brightness(1.04); }
+
+html.mac #err-bar {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 48px);
+  border: 0;
+  border-radius: 999px;
+  background: var(--solid);
+  color: var(--red-text);
+  box-shadow: 0 0 0 .5px var(--solid-edge), var(--shadow-deep);
+}
+
+/* ── 设置窗：整窗玻璃外框 + 系统设置式分组 ───────────── */
+
+html.mac body.settings-win #app {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+html.mac .glass-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: transparent;
+}
+/* 标题由系统绘制（覆盖式标题栏），这里只留拖拽区 */
+html.mac .s-titlebar { flex: none; height: 40px; }
+html.mac .settings {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 20px 22px;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 12px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 12px);
+}
+html.mac .s-group-label {
+  padding: 14px 12px 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--label-2);
+}
+html.mac .s-group {
+  padding: 0 14px;
+  border-radius: 14px;
+  background: var(--group);
+  box-shadow: 0 0 0 .5px var(--group-edge), inset 0 1px 0 var(--group-hi);
+}
+html.mac .s-group.s-pad { padding: 12px 14px; }
+html.mac .s-group .tog-row {
+  min-height: 46px;
+  padding: 9px 0;
+  border-bottom: .5px solid var(--separator);
+}
+html.mac .s-group .tog-row:last-child { border-bottom: 0; }
+html.mac .tog-label { font-size: 13px; font-weight: 500; color: var(--label); }
+html.mac .tog-desc { margin-top: 1px; font-size: 11.5px; line-height: 1.4; color: var(--label-2); }
+html.mac .s-field { padding: 10px 0 12px; }
+html.mac .settings .path-line { gap: 6px; align-items: center; }
+html.mac .settings input {
+  height: 28px;
+  padding: 0 9px;
+  font-family: var(--body);
+  font-size: 12.5px;
+  color: var(--label);
+  background: var(--field);
+  border: .5px solid var(--field-edge);
+  border-radius: 7px;
+}
+html.mac .settings input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+html.mac .settings input::placeholder { color: var(--label-3); }
+html.mac .lib-row { gap: 8px; margin: 0; }
+html.mac .settings .hint {
+  margin: 0;
+  padding: 16px 12px 0;
+  border-top: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--label-2);
+}
+html.mac .gh-row { margin: 0; padding: 10px 12px 0; }
+html.mac .gh-link { font-size: 12px; color: var(--accent-text); }

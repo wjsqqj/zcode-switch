@@ -3,6 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- macOS：首帧前打上 mac 类，启用原生玻璃布局（src/mac.css + src/glass.js） -->
+    <script>if (/Macintosh/.test(navigator.userAgent)) document.documentElement.classList.add("mac");</script>
     <title>Z·SWITCH</title>
     <style>
       html, body { background: #0a0a0c; }
@@ -24,6 +26,7 @@
     </style>
     <!-- 普通 link：dev 下 vite 会重写为模块注入（media 技巧会破坏该转换）；prod 为本地文件秒到 -->
     <link rel="stylesheet" href="/src/styles.css" />
+    <link rel="stylesheet" href="/src/mac.css" />
   </head>
   <body class="settings-win">
     <div id="app"></div>

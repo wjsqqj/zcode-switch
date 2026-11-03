@@ -7,6 +7,8 @@
     "core:window:allow-set-title",
     "core:window:allow-is-focused",
     "core:window:allow-request-user-attention",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize",
     "dialog:default",
     "notification:default"
   ]

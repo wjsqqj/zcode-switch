@@ -271,4 +271,12 @@ export const en = {
   "c.initFail": "Captcha initialization failed",
   "c.inPopup": "Complete verification in the popup…",
   "c.cspBlocked": "CSP blocked {directive} ← {uri}",
+
+  // macOS 玻璃布局（侧栏 / 设置分组）
+  "mac.accounts": "Accounts",
+  "mac.actions": "Actions",
+  "mac.general": "General",
+  "mac.language": "Language",
+  "mac.auth": "Sign-in",
+  "mac.path": "ZCode app",
 };
