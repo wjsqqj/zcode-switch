@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
@@ -38,6 +38,14 @@ windows-sys = { version = "0.52", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 原生玻璃（glass.rs）：NSGlassEffectView / NSVisualEffectView 挂在 WKWebView 下方
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSGraphics", "NSAppearance", "NSGlassEffectView", "NSVisualEffectView", "objc2-core-foundation", "objc2-quartz-core"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColor", "CGPath"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CALayer", "CAShapeLayer", "CATransaction", "objc2-core-foundation", "objc2-core-graphics"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # X-Client-Timezone 的 IANA 名（Node Intl 同源）

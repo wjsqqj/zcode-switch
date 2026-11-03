@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { esc, toast, openPwModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, lang, stripErr } from "./i18n.js";
+import { IS_MAC, initGlass } from "./glass.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -155,7 +156,7 @@ const toggle = (on, onclickAttr, label, desc) => `
 
 const langSeg = (cur) => `
   <div class="tog-row">
-    <div class="tog-info"><div class="tog-label">${t("s.langLabel")}</div></div>
+    <div class="tog-info"><div class="tog-label">${IS_MAC ? t("mac.language") : t("s.langLabel")}</div></div>
     <div class="lang-seg" role="radiogroup" aria-label="${t("s.langLabel")}">
       <button class="lang-opt${cur === "zh" ? " on" : ""}" role="radio" aria-checked="${cur === "zh"}" click="actions.setLang('zh')">${t("s.langZh")}</button>
       <button class="lang-opt${cur === "en" ? " on" : ""}" role="radio" aria-checked="${cur === "en"}" click="actions.setLang('en')">${t("s.langEn")}</button>
@@ -169,6 +170,10 @@ function render() {
   }
   const s = state;
   document.title = `Z·SWITCH ${t("s.title")}`;
+  if (IS_MAC) {
+    renderMac(s);
+    return;
+  }
   $app.innerHTML = `
     <header class="topbar">
       <div class="wordmark">Z·SWITCH <span class="ver">/ ${t("s.title")}</span></div>
@@ -205,10 +210,64 @@ function render() {
     </section>`;
 }
 
+// macOS：整窗外框是取样桌面的原生玻璃（.glass-backdrop），设置项按系统设置的分组样式排列
+function renderMac(s) {
+  $app.innerHTML = `
+    <div class="glass-backdrop" data-glass="window" data-glass-source="desktop"></div>
+    <header class="s-titlebar" data-tauri-drag-region="deep"></header>
+    <section class="settings open">
+      <div class="s-group-label">${t("mac.general")}</div>
+      <div class="s-group">
+        ${langSeg(s.language || "zh")}
+        ${toggle(autostart, "actions.toggleAutostart()", t("s.autostart"), t("s.autostartDesc"))}
+      </div>
+
+      <div class="s-group-label">${t("s.behaviorLabel")}</div>
+      <div class="s-group">
+        ${toggle(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
+        ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
+        ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
+        ${toggle(s.activity_probe, "actions.toggleBehavior('probe')", t("s.activityProbe"), t("s.activityProbeDesc"))}
+        ${toggle(s.claim_at_effective, "actions.toggleBehavior('atm')", t("s.claimAtEffective"), t("s.claimAtEffectiveDesc"))}
+      </div>
+
+      <div class="s-group-label">${t("mac.auth")}</div>
+      <div class="s-group">
+        ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
+        <div class="path-line s-field">
+          <input class="zcode-path auth-proxy" type="text" value="${esc(s.auth_proxy_url || "")}"
+            placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
+          <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
+        </div>
+      </div>
+
+      <div class="s-group-label">${t("mac.accounts")}</div>
+      <div class="s-group s-pad">
+        <div class="lib-row">
+          <button class="btn-ghost has-ic" click="actions.importFiles()">${ic("import", 14)} ${t("s.importBtn")}</button>
+          <button class="btn-ghost has-ic" click="actions.exportAll()" ${s.accounts.length ? "" : "disabled"}>${ic("exportAll", 14)} ${t("s.exportAllBtn")}</button>
+        </div>
+      </div>
+
+      <div class="s-group-label">${t("mac.path")}</div>
+      <div class="s-group s-pad">
+        <div class="path-line">
+          <input class="zcode-path" type="text" value="${esc(s.zcode_path)}" placeholder="/Applications/ZCode.app" keydown="onPathKey(event)">
+          <button class="btn-ghost" click="actions.browsePath()">${t("s.browse")}</button>
+          <button class="btn-ghost" click="actions.savePath()">${t("common.save")}</button>
+        </div>
+      </div>
+
+      <div class="hint">${t("s.hint")}</div>
+      <div class="gh-row"><a class="gh-link" href="https://github.com/pjpv/zcode-switch" target="_blank" rel="noopener" click="actions.openGitHub()">${t("s.githubLink")}</a>${appVer ? `<span class="ver">v${esc(appVer)}</span>` : ""}</div>
+    </section>`;
+}
+
 window.actions = actions;
 window.onPathKey = (e) => { if (e.key === "Enter") actions.savePath(); };
 window.onProxyKey = (e) => { if (e.key === "Enter") actions.saveProxy(); };
 installDelegation();
+initGlass();
 
 listen("state-changed", () => {
   refresh().then(render).catch(() => {});

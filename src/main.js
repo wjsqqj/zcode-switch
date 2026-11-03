@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { esc, toast, openPwModal, openConfirmModal, openProviderModal, openActivityModal, activityToast, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
+import { IS_MAC, initGlass } from "./glass.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -1770,43 +1771,93 @@ function renderInner() {
 
   const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
 
-  $app.innerHTML = `
-    <header class="topbar">
-      <div class="wordmark">Z·SWITCH${appVer ? ` <span class="ver">v${esc(appVer)}</span>` : ""}</div>
+  const verHtml = appVer ? `<span class="ver">v${esc(appVer)}</span>` : "";
+  const statusHtml = `
       <div class="top-status${unsaved ? " unsaved" : ""}">
         <span class="status-dot ${dotCls}"></span>
         <span class="status-text">${esc(statusText)}</span>
-      </div>
-    </header>
-
-    <section class="toolbar">
+      </div>`;
+  const saveBtn = `
       <button class="btn-primary has-ic${unsaved ? " attention" : ""}" click="actions.capture()" ${!s.live_logged_in || active ? "disabled" : ""}
         title="${active ? esc(t("m.saveLoginDisabledTitle", { name: active.name })) : ""}">
         ${ic("capture", 16)} ${t("btn.saveLogin")}
-      </button>
-      ${claimableCount > 0
-        ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
-            title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
-        : ""}
-      ${(s.accounts.length > 0)
-        ? `<button class="btn-ghost has-ic${refreshTopOff ? " is-off" : ""}" click="actions.refreshClaim()"
-            title="${esc(refreshTopTitle)}">${ic("refresh", 16)} <span id="refresh-claim-label">${esc(refreshTopLabel)}</span></button>`
-        : ""}
+      </button>`;
+  const claimAllBtn = claimableCount > 0
+    ? `<button class="btn-ghost has-ic claim-all" click="actions.claimAll()" ${claimAllRunning || refreshClaim.running || autoClaimRunning ? "disabled" : ""}
+        title="${t("btn.claimAllTitle")}">${ic("gift", 16)} ${t("btn.claimAll")}${claimableCount > 1 ? ` (${claimableCount})` : ""}</button>`
+    : "";
+  const refreshBtn = s.accounts.length > 0
+    ? `<button class="btn-ghost has-ic${refreshTopOff ? " is-off" : ""}" click="actions.refreshClaim()"
+        title="${esc(refreshTopTitle)}">${ic("refresh", 16)} <span id="refresh-claim-label">${esc(refreshTopLabel)}</span></button>`
+    : "";
+  const activityBtn = `
       <button class="btn-ghost has-ic${actCount ? "" : " is-off"}" click="actions.openActivity()"
         title="${esc(actBtnTitle)}">
         ${ic("gift", 16)} ${esc(t("btn.activity"))}${actCount ? ` (${actCount})` : ""}
-      </button>
+      </button>`;
+  const autoToggle = `
       <button class="tog-inline${s.auto_claim ? " on" : ""}${autoClaimRunning ? " running" : ""}"
         role="switch" aria-checked="${s.auto_claim}" aria-label="${t("btn.autoClaim")}"
         title="${autoPillTitle(s)}"
         click="actions.toggleAutoClaim()">
         <span class="toggle${s.auto_claim ? " on" : ""}" aria-hidden="true"><span class="knob"></span></span>
         ${t("btn.autoClaim")}
-      </button>
-      <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
-      ${s.zcode_running
-        ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
-        : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
+      </button>`;
+  const addBtn = `<button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>`;
+  const zcodeBtn = s.zcode_running
+    ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
+    : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`;
+
+  if (IS_MAC) {
+    // macOS：侧栏是取样桌面的原生玻璃（底色层镂空），工具栏胶囊取样窗口底色；二者上方各层都不绘制底色
+    $app.innerHTML = `
+    <aside class="sidebar" data-glass="sidebar" data-glass-source="desktop">
+      <div class="sb-head" data-tauri-drag-region="deep">
+        <div class="sb-brand"><div class="wordmark">Z<span class="tick">·</span>SWITCH</div>${verHtml}</div>
+        ${statusHtml}
+      </div>
+      <nav class="sb-nav">
+        <div class="sb-label">${t("mac.actions")}</div>
+        ${saveBtn}
+        ${addBtn}
+        ${claimAllBtn}
+        ${zcodeBtn}
+      </nav>
+      <div class="sb-foot">
+        ${autoToggle}
+        <button class="btn-ghost has-ic sb-settings" click="actions.openSettings()">${ic("sliders", 16)} ${t("common.settings")}</button>
+      </div>
+    </aside>
+
+    <section class="content">
+      <header class="content-head" data-tauri-drag-region="deep">
+        <div class="ch-title">
+          <h1>${t("mac.accounts")}</h1>
+          <span class="count">${t("m.count", { count: s.accounts.length })}</span>
+        </div>
+        <div class="tb-capsule" data-glass="toolbar">${refreshBtn}${activityBtn}</div>
+      </header>
+      <main class="list">${listHtml}</main>
+    </section>
+  `;
+    restoreScroll(scrollCap);
+    return;
+  }
+
+  $app.innerHTML = `
+    <header class="topbar">
+      <div class="wordmark">Z·SWITCH${appVer ? ` ${verHtml}` : ""}</div>
+      ${statusHtml}
+    </header>
+
+    <section class="toolbar">
+      ${saveBtn}
+      ${claimAllBtn}
+      ${refreshBtn}
+      ${activityBtn}
+      ${autoToggle}
+      ${addBtn}
+      ${zcodeBtn}
       <span class="tb-spacer"></span>
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>
@@ -1827,6 +1878,7 @@ window.onRenameKey = (e, id) => {
   if (e.key === "Escape") actions.cancelRename();
 };
 installDelegation();
+initGlass();
 loadProbeState();
 loadReminders();
 loadMarks();

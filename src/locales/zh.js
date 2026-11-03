@@ -251,4 +251,12 @@ export const zh = {
   "c.initFail": "验证码初始化失败",
   "c.inPopup": "请在弹窗中完成验证…",
   "c.cspBlocked": "CSP 拦截 {directive} ← {uri}",
+
+  // macOS 玻璃布局（侧栏 / 设置分组）
+  "mac.accounts": "账号库",
+  "mac.actions": "操作",
+  "mac.general": "通用",
+  "mac.language": "语言",
+  "mac.auth": "授权登录",
+  "mac.path": "ZCode 程序路径",
 };
