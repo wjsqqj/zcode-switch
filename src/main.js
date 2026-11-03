@@ -6,6 +6,7 @@ import { esc, toast, openPwModal, openConfirmModal, openProviderModal, openActiv
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 import { IS_MAC, initGlass } from "./glass.js";
+import { fmtDateTime, resolveEffective, rangeOf } from "./claim-time.js";
 
 const $app = document.getElementById("app");
 let state = null;
@@ -54,6 +55,9 @@ function upsertPlanMeta(plans) {
     const campaignId = c.campaign_id || c.campaignId || "";
     if (!campaignId) continue;
     const prev = planMeta[planId] || {};
+    // 生效时间缓存：服务端只在 current/领取响应里给 effective_at，可领状态只能从文案兜底；
+    // 缓存后「已领取」条目即使没有 campaign，也能继续展示正确语义。
+    const eff = resolveEffective(p, c);
     const next = {
       campaignId,
       position: c.position || prev.position || "",
@@ -62,6 +66,8 @@ function upsertPlanMeta(plans) {
       buttons: (c.buttons || []).length ? c.buttons : (prev.buttons || []),
       startsAt: c.starts_at ?? c.startsAt ?? prev.startsAt ?? null,
       endsAt: c.ends_at ?? c.endsAt ?? prev.endsAt ?? null,
+      effectiveAt: eff.at ?? prev.effectiveAt ?? null,
+      effectiveSource: eff.source || prev.effectiveSource || null,
     };
     if (JSON.stringify(prev) !== JSON.stringify(next)) {
       planMeta[planId] = next;
@@ -110,19 +116,38 @@ async function ensureNotifyPermission() {
   }
 }
 
-function fmtDateTime(ms) {
-  return ms
-    ? new Date(ms).toLocaleString(localeTag(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
-    : "";
+const CLAIM_RANGE_KEYS = {
+  effective: "claim.timeRange",
+  pending: "claim.pendingRange",
+  estimated: "claim.estimatedRange",
+  activity: "claim.activityRange",
+};
+
+/// 统一区间文案：只有 effectiveAt 能说「生效」，startsAt 一律标「活动」。
+function timeRangeText({ startsAt = null, endsAt = null, effectiveAt = null, effectiveSource = null } = {}) {
+  const g = rangeOf({ startsAt, endsAt, effectiveAt, effectiveSource });
+  const key = CLAIM_RANGE_KEYS[g.kind];
+  if (!key) return { text: "", kind: g.kind, pending: false, startMs: null };
+  const start = g.startMs === 0 ? t("claim.effectiveNow") : fmtDateTime(g.startMs);
+  const end = g.endMs ? fmtDateTime(g.endMs) : t("claim.notProvided");
+  return {
+    text: t(key, { start, end }),
+    kind: g.kind,
+    pending: g.kind === "pending" || g.kind === "estimated",
+    startMs: g.startMs,
+  };
 }
 
-/// 「什么时候生效 → 什么时候结束」：生效优先 effective_at（权益生效），其次 starts_at
-function claimTimeRange(p) {
-  const startMs = p.effective_at ?? p.starts_at ?? null;
-  const start = startMs ? fmtDateTime(startMs) : t("claim.notProvided");
-  const end = p.ends_at ? fmtDateTime(p.ends_at) : t("claim.notProvided");
-  const pending = !!startMs && startMs > Date.now();
-  return { text: t(pending ? "claim.pendingRange" : "claim.timeRange", { start, end }), pending, startMs, end };
+/// 套餐条目 → 区间文案。`body` 给「字段缺失 → 文案兜底」用（claimed/current 没有 campaign）。
+function claimTimeRange(p, body = "") {
+  const camp = p?.campaign || null;
+  const eff = resolveEffective(p, camp || { body });
+  return timeRangeText({
+    startsAt: p?.starts_at ?? camp?.starts_at ?? camp?.startsAt ?? null,
+    endsAt: p?.ends_at ?? camp?.ends_at ?? camp?.endsAt ?? null,
+    effectiveAt: eff.at,
+    effectiveSource: eff.source,
+  });
 }
 
 const AUTO_CLAIM_INTERVAL_MS = 10 * 60 * 1000;
@@ -230,9 +255,52 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
+// 版本诊断：活动按 X-ZCode-App-Version 下发，缓存过期/内置常量落后都会导致刷不出来。
+// Rust 侧在每次刷新活动时 ensure_fresh（后台线程），这里只负责取快照与提示。
+let versionInfo = null;
+let versionToastShown = false;
+// 最近一次刷新的通道诊断（preview/marketing 是否「服务端明确返回空」）
+let activityDiag = null;
+
+let previewErrorToasted = false;
+
+function noteDiag(d) {
+  if (!d) return;
+  activityDiag = d;
+  // preview 挂了但 marketing 兜底成功：提示一次「已降级」，避免用户以为数据不全
+  if (d.previewError && !previewErrorToasted) {
+    previewErrorToasted = true;
+    toast(t("m.previewDegraded"), "warn");
+  }
+}
+
+async function loadVersionStatus() {
+  try {
+    versionInfo = await invokeWithTimeout("version_status", {}, 15_000);
+    return versionInfo;
+  } catch {
+    return versionInfo;
+  }
+}
+
+/// 把 claim_refresh 返回的版本快照记下来；同一会话只提示一次，避免每次刷新都弹。
+function noteVersion(v) {
+  if (!v) return;
+  versionInfo = v;
+  if (versionToastShown) return;
+  if (v.constantBehind) {
+    versionToastShown = true;
+    toast(t("m.versionBehind", { constant: v.clientConstant, latest: v.latest || "?" }), "warn");
+  } else if (v.stale) {
+    versionToastShown = true;
+    toast(t("m.versionStale", { reported: v.reported }), "warn");
+  }
+}
+
 async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
+  loadVersionStatus();
   maybeStartProbe();
   startReminderTicker();
 }
@@ -304,15 +372,38 @@ async function awaitClaimPreviewFresh(id) {
 async function fetchClaimed(id) {
   try {
     const r = await invokeWithTimeout("claim_current", { id });
-    claimedState[id] = { plans: r.plans || [], history: r.history || [], err: null };
+    // 保留 quotaPlans/hintAt：否则每次刷新都会重新拉一次额度
+    claimedState[id] = { ...(claimedState[id] || {}), plans: r.plans || [], history: r.history || [], err: null };
     // 已领取/待生效也进目录：服务端之后不再下发，只能靠目录在重启后继续展示
     upsertCatalog(id, r.plans || [], true);
+    // current 在权益生效前不返回待生效套餐（实测已领账号返回空 data）：
+    // 用余额接口的 Start Plan 套餐名兜底推断「已领取」。
+    if (!(r.plans || []).length) await fetchClaimedHint(id);
   } catch (e) {
     claimedState[id] = {
+      ...(claimedState[id] || {}),
       plans: claimedState[id]?.plans || [],
       history: claimedState[id]?.history || [],
       err: String(e),
     };
+  }
+}
+
+/// current 为空时的「已领取」推断：余额接口仍保留活动套餐名与 Start 等级
+/// （实测：未领取 plan_tier=null；已领取 tier="Start Plan", plans[0].name=活动名）。
+/// 10 分钟节流 + 失败静默——推断失败不能影响主流程，也不能放大上游请求。
+const CLAIMED_HINT_TTL_MS = 10 * 60 * 1000;
+async function fetchClaimedHint(id) {
+  const prev = claimedState[id] || {};
+  if (prev.hintAt && Date.now() - prev.hintAt < CLAIMED_HINT_TTL_MS) return;
+  try {
+    const q = await invokeWithTimeout("get_account_quota", { id });
+    const plans = (q?.plans || []).filter(
+      (p) => p?.name && (p.tier_code === "start" || /start/i.test(p.tier || "")),
+    );
+    claimedState[id] = { ...(claimedState[id] || { plans: [], history: [], err: null }), quotaPlans: plans, hintAt: Date.now() };
+  } catch {
+    claimedState[id] = { ...(claimedState[id] || { plans: [], history: [], err: null }), hintAt: Date.now() };
   }
 }
 
@@ -340,18 +431,19 @@ const actions = {
 
   // 活动详情：accountId 传入时先展示该账号，未命中则回退到全量列表。
   // 手动打开视为显式意图：已开启探测时后台补探一次（30s 节流，绕过静默期）。
-  openActivity(accountId) {
+  async openActivity(accountId) {
     stopTrayFlash(); // 用户已查看活动，停止持续闪烁
     setActivityTip(null); // 用户已查看活动，清掉标题/托盘提示
+    if (!versionInfo) await loadVersionStatus();
     if (state?.activity_probe && !probe.running && Date.now() - (probe.manualAt || 0) > 30_000) {
       probe.manualAt = Date.now();
       const ids = shuffle((state?.accounts || []).map((a) => a.id)).slice(0, 2);
       if (ids.length) probeOnce(ids, true).catch(() => {});
     }
     const rows = activityRows();
-    if (!rows.length) { toast(t("m.activityNoneHint"), "warn"); return; }
     const mine = accountId ? rows.filter((r) => r.accountId === accountId) : [];
-    openActivityModal({ rows: mine.length ? mine : rows, focusAccount: accountId });
+    // 空列表也要打开面板：空态里要说明「为什么没有」（服务端未下发 / 版本 / 官方客户端限制）
+    openActivityModal({ rows: mine.length ? mine : rows, focusAccount: accountId, version: versionInfo, diag: activityDiag });
   },
 
   // 手动刷新时强制探测一次（绕过静默期，用户显式意图）
@@ -628,6 +720,8 @@ const actions = {
         try {
           const r = await invokeWithTimeout("claim_refresh", { id, force: true });
           claimable[id] = { plans: r.plans || [], err: null, busy: false };
+          noteVersion(r.version);
+          noteDiag(r.diag);
           await fetchClaimed(id);
           if ((r.plans || []).length) okCount++;
           if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
@@ -660,6 +754,8 @@ const actions = {
     try {
       const r = await invokeWithTimeout("claim_refresh", { id, force: true });
       claimable[id] = { plans: r.plans || [], err: null, busy: false };
+      noteVersion(r.version);
+      noteDiag(r.diag);
       await fetchClaimed(id);
       if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
     } catch (e) {
@@ -908,17 +1004,30 @@ function shuffle(list) {
 function activityRows() {
   const now = Date.now();
   const rows = [];
-  const seen = new Set();
+  const rowIndex = new Map();
+  // 同一 key 只保留一条：「已领取 / 已过期」优先于「可领」，
+  // 否则领取成功后旧探测缓存会让条目继续显示「可领」。
+  const pushRow = (row) => {
+    const prev = rowIndex.get(row.key);
+    if (prev == null) {
+      rowIndex.set(row.key, rows.length);
+      rows.push(row);
+      return;
+    }
+    if (rows[prev].status === "claimable" && row.status !== "claimable") rows[prev] = row;
+  };
   const add = (acc, p, status) => {
     const c = p.campaign || null;
     const planId = p.plan_id || p.planId || "";
+    if (!planId) return;
     const meta = planMeta[planId] || null;
     const campaignId = c?.campaign_id || c?.campaignId || meta?.campaignId || "";
-    const key = `${acc.id}|${campaignId}|${planId}`;
-    if (!planId || seen.has(key)) return;
-    seen.add(key);
-    rows.push({
-      key,
+    // 生效时间：字段优先，缺失时用活动正文兜底（并保留来源供 UI 标注）
+    const eff = resolveEffective(p, c || { body: meta?.body || "" });
+    const effectiveAt = eff.at ?? meta?.effectiveAt ?? null;
+    const effectiveSource = eff.source || (effectiveAt != null ? meta?.effectiveSource || "field" : null);
+    pushRow({
+      key: `${acc.id}|${campaignId}|${planId}`,
       accountId: acc.id,
       accountName: acc.name,
       planId,
@@ -929,7 +1038,8 @@ function activityRows() {
       position: c?.position || meta?.position || "",
       buttons: (c?.buttons || []).length ? c.buttons : (meta?.buttons || []),
       startsAt: p.starts_at ?? c?.starts_at ?? c?.startsAt ?? meta?.startsAt ?? null,
-      effectiveAt: p.effective_at ?? null,
+      effectiveAt,
+      effectiveSource,
       endsAt: p.ends_at ?? c?.ends_at ?? c?.endsAt ?? meta?.endsAt ?? null,
       grants: (p.grant_items || []).map((g) => `${g.name} ${fmtTokens(g.units)}${g.period ? " · " + g.period : ""}`),
     });
@@ -946,16 +1056,15 @@ function activityRows() {
     const claimedIds = new Set(active.map((p) => p.plan_id).filter(Boolean));
     for (const p of active) add(a, p, p.ends_at && p.ends_at < now ? "expired" : "claimed");
 
-    // 持久化目录兜底：重启后 / 已静默不探测时，历史活动仍能展示（含已过期）
+    // 持久化目录兜底：重启后 / 已静默不探测时，历史活动仍能展示（含已过期）。
+    // 老目录条目没有 effectiveAt：现场用缓存正文现解析，避免升级后仍显示「未提供」。
     for (const e of Object.values(catalog)) {
       if (e.accountId !== a.id) continue;
       if (liveIds.has(e.planId) || claimedIds.has(e.planId)) continue;
       const expired = !!e.endsAt && e.endsAt < now;
-      const key = `${a.id}|${e.campaignId}|${e.planId}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      rows.push({
-        key,
+      const eff = resolveEffective({ effective_at: e.effectiveAt }, { body: e.body || "" });
+      pushRow({
+        key: `${a.id}|${e.campaignId}|${e.planId}`,
         accountId: a.id,
         accountName: a.name,
         planId: e.planId,
@@ -966,16 +1075,55 @@ function activityRows() {
         position: e.position,
         buttons: e.buttons || [],
         startsAt: e.startsAt,
-        effectiveAt: e.effectiveAt,
+        effectiveAt: eff.at,
+        effectiveSource: eff.source || e.effectiveSource || null,
         endsAt: e.endsAt,
         grants: e.grants || [],
       });
     }
 
+    // 余额推断：current 为空但 Start 套餐里已有同名活动 → 标为已领取
+    const quotaPlans = claimedState[a.id]?.quotaPlans || [];
+    if (quotaPlans.length) {
+      const titles = new Set(rows.filter((r) => r.accountId === a.id).map((r) => r.title));
+      for (const qp of quotaPlans) {
+        const name = String(qp.name || "").trim();
+        if (!name || titles.has(name)) continue;
+        titles.add(name);
+        pushRow({
+          key: `${a.id}|quota|${name}`,
+          accountId: a.id,
+          accountName: a.name,
+          planId: name,
+          campaignId: "",
+          status: "claimed",
+          title: name,
+          body: "",
+          position: "",
+          buttons: [],
+          startsAt: null,
+          effectiveAt: null,
+          effectiveSource: null,
+          endsAt: null,
+          grants: [],
+          inferred: true,
+        });
+      }
+    }
+
+    // current 不可用（本机实测已领账号返回空 data）时，用本地历史兜底展示区间
     if (!active.length && !live.length) {
       const hist = claimedState[a.id]?.history || [];
       const last = hist[hist.length - 1];
-      if (last) add(a, { plan_id: last.planId, name: last.planName }, "expired");
+      if (last) {
+        add(a, {
+          plan_id: last.planId,
+          name: last.planName,
+          starts_at: last.startsAt ?? null,
+          ends_at: last.endsAt ?? null,
+          effective_at: last.effectiveAt ?? null,
+        }, last.endsAt && last.endsAt < now ? "expired" : "claimed");
+      }
     }
   }
   return rows;
@@ -1038,6 +1186,7 @@ function applyProbeResult(item) {
     try { localStorage.setItem(KNOWN_KEY, JSON.stringify(known)); } catch { /* ignore */ }
   }
   notifyNewActivities(id, plans, true);
+  loadVersionStatus(); // 探测后刷新版本快照：空态里要展示「为什么没有」
   if (!uiLocked()) render();
 }
 
@@ -1079,6 +1228,8 @@ function notifyNewActivities(accountId, plans, claimable) {
     openActivityModal({
       rows: activityRows().filter((r) => r.accountId === accountId),
       focusAccount: accountId,
+      version: versionInfo,
+      diag: activityDiag,
     });
   };
   const firstTitle = plans[0]?.campaign?.title || plans[0]?.name || plans[0]?.plan_id || "";
@@ -1299,7 +1450,7 @@ function checkReminders() {
     firedReminders.add(r.key);
     saveReminders();
     toast(t(r.kind === "start" ? "act.startReminder" : "act.effectiveReminder", { name: r.name, title: r.title }), "ok");
-    openActivityModal({ rows: activityRows().filter((x) => x.accountId === r.accountId), focusAccount: r.accountId });
+    openActivityModal({ rows: activityRows().filter((x) => x.accountId === r.accountId), focusAccount: r.accountId, version: versionInfo, diag: activityDiag });
     if (state?.claim_at_effective) scheduleClaimAtEffective();
   }
 }
@@ -1467,6 +1618,9 @@ function upsertCatalog(accountId, plans, claimedHint = false) {
     const k = `${accountId}|${planId}`;
     const prev = catalog[k] || {};
     if (!prev.planId) added++;
+    // 生效时间与其来源必须一起持久化，否则重启后「预计生效」会被误标成「已生效」
+    const eff = resolveEffective(p, c || meta);
+    const effAt = eff.at ?? prev.effectiveAt ?? meta.effectiveAt ?? null;
     catalog[k] = {
       accountId,
       planId,
@@ -1476,7 +1630,8 @@ function upsertCatalog(accountId, plans, claimedHint = false) {
       position: c?.position || prev.position || meta.position || "",
       buttons: (c?.buttons || []).length ? c.buttons : (prev.buttons || meta.buttons || []),
       startsAt: p.starts_at ?? c?.starts_at ?? c?.startsAt ?? prev.startsAt ?? meta.startsAt ?? null,
-      effectiveAt: p.effective_at ?? prev.effectiveAt ?? null,
+      effectiveAt: effAt,
+      effectiveSource: eff.source || prev.effectiveSource || (effAt != null ? meta.effectiveSource || null : null),
       endsAt: p.ends_at ?? c?.ends_at ?? c?.endsAt ?? prev.endsAt ?? meta.endsAt ?? null,
       grants: (p.grant_items || []).length
         ? p.grant_items.map((g) => `${g.name} ${fmtTokens(g.units)}${g.period ? " · " + g.period : ""}`)
@@ -1512,16 +1667,13 @@ function claimStripHtml(id) {
   if (!plan) return "";
   const grants = grantLabel(plan);
   const label = plan.name || plan.plan_id;
-  const camp = plan.campaign;
-  const tr = camp && (camp.endsAt || camp.ends_at)
-    ? claimTimeRange({ starts_at: camp.startsAt ?? camp.starts_at, ends_at: camp.endsAt ?? camp.ends_at })
-    : null;
+  const tr = claimTimeRange(plan);
   return `
   <div class="claim-strip" click="actions.openActivity('${id}')" title="${esc(t("act.openDetail"))}">
     ${ic("gift", 15)}
     <span class="claim-name">${esc(label)}</span>
     ${grants ? `<span class="claim-grants">${esc(grants)}</span>` : ""}
-    ${tr ? `<span class="claim-grants${tr.pending ? " warn-line" : ""}">${esc(tr.text)}</span>` : ""}
+    ${tr.text ? `<span class="claim-grants${tr.pending ? " warn-line" : ""}">${esc(tr.text)}</span>` : ""}
     <button class="btn-claim has-ic" click="actions.claim('${id}')" ${claimAllRunning || refreshClaim.running || claimActive || autoClaimRunning ? "disabled" : ""}>${ic("gift", 13)} ${t("btn.claim")}</button>
   </div>`;
 }
@@ -1574,14 +1726,25 @@ function claimedStripHtml(id) {
     .map((g) => `${g.name} ${fmtTokens(g.units)}`)
     .join(" · ");
   const active = (cs.plans || []).filter((p) => !p.status || p.status === "active");
-  let html = active.map((p) => {
-    const tr = claimTimeRange(p);
+  // 余额推断出的已领取套餐（current 为空时）：只显示名称 + 待生效提示
+  const inferred = (cs.quotaPlans || []).filter(
+    (q) => q.name && !active.some((p) => (p.name || p.plan_id) === q.name),
+  );
+  let html = inferred.map((q) => `
+    <div class="claim-strip claimed" click="actions.openActivity('${id}')" title="${esc(t("act.openDetail"))}">
+      ${ic("gift", 15)}
+      <span class="claim-name">${esc(q.name)}</span>
+      <span class="claim-grants">${esc(t("claim.claimedHint"))}</span>
+    </div>`).join("");
+  html += active.map((p) => {
+    // current 的 plan 没有 campaign：用 planMeta 里的活动正文兜底解析生效时间
+    const tr = claimTimeRange(p, planMeta[p.plan_id]?.body || "");
     return `
     <div class="claim-strip claimed" click="actions.openActivity('${id}')" title="${esc(t("act.openDetail"))}">
       ${ic("gift", 15)}
       <span class="claim-name">${esc(p.name || p.plan_id)}</span>
       ${grants(p) ? `<span class="claim-grants">${esc(grants(p))}</span>` : ""}
-      <span class="claim-grants${tr.pending ? " warn-line" : ""}">${esc(tr.text)}</span>
+      ${tr.text ? `<span class="claim-grants${tr.pending ? " warn-line" : ""}">${esc(tr.text)}</span>` : ""}
     </div>`;
   }).join("");
   // 有「当前可领」的活动时不再展示旧活动的历史条，避免同一行两三个条混淆
@@ -1590,10 +1753,23 @@ function claimedStripHtml(id) {
     const last = cs.history[cs.history.length - 1];
     const name = last?.planName || last?.planId || "";
     if (name) {
+      // 本地历史（领取响应落盘）也带时间：已领取过 X · 生效 … → 至 …
+      // 老历史没有时间字段：退回 planMeta 的活动正文/时间窗，仍拿不到就标「时间未记录」。
+      const meta = planMeta[last.planId] || {};
+      const eff = resolveEffective({ effective_at: last.effectiveAt }, { body: meta.body || "" });
+      const tr = timeRangeText({
+        startsAt: last.startsAt ?? meta.startsAt ?? null,
+        endsAt: last.endsAt ?? meta.endsAt ?? null,
+        effectiveAt: eff.at,
+        effectiveSource: eff.source,
+      });
+      const text = tr.text
+        ? t("claim.historyRange", { name, range: tr.text })
+        : t("claim.historyNoTime", { name });
       html += `
-      <div class="claim-strip history">
+      <div class="claim-strip history" click="actions.openActivity('${id}')" title="${esc(t("act.openDetail"))}">
         ${ic("gift", 15)}
-        <span class="claim-name">${esc(t("claim.historyStrip", { name }))}</span>
+        <span class="claim-name">${esc(text)}</span>
       </div>`;
     }
   }
@@ -1905,8 +2081,8 @@ listen("claim://result", (ev) => {
     const bits = [];
     const now = p.serverTime || Date.now();
     const effAt = p.effectiveAt ?? null;
-    if (effAt && effAt > now) bits.push(t("m.claimEffectiveAt", { time: new Date(effAt).toLocaleString(localeTag(), { hour12: false }) }));
-    if (p.endsAt) bits.push(t("m.claimEndsAt", { time: new Date(p.endsAt).toLocaleString(localeTag(), { hour12: false }) }));
+    if (effAt && effAt > now) bits.push(t("m.claimEffectiveAt", { time: fmtDateTime(effAt) }));
+    if (p.endsAt) bits.push(t("m.claimEndsAt", { time: fmtDateTime(p.endsAt) }));
     toast(t("m.claimOk", { name: p.accountName, plan: p.planName }), "ok", bits.join(t("common.listSep")));
   }
   if (p.accountId) {

@@ -5,7 +5,6 @@ use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
 
 /// 上游基址：测试经 ZCODE_API_BASE 旁路指向本地 mock（默认官方）。
 pub const API_BASE_DEFAULT: &str = "https://zcode.z.ai";
@@ -51,6 +50,10 @@ pub struct ClaimPlan {
     pub grants: Vec<String>,
     #[serde(default)]
     pub grant_items: Vec<ClaimGrant>,
+    /// 权益真实生效时间（ms）：`entitlements[].effective_at` 最小值；0 = 立即生效。
+    /// `starts_at` 只是活动开始，**不能**当生效时间用；上游未下发时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_at: Option<i64>,
     /// 活动元数据（仅 marketing/touch 通道携带；preview 通道为 None）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub campaign: Option<ActivityCampaign>,
@@ -182,19 +185,27 @@ fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<St
     Err(crate::i18n::tr("err.claim.no_jwt"))
 }
 
+/// 诊断用：当前账号实际会用哪种 token 调上游（**只返回枚举，不泄露 token**）。
+pub(crate) fn token_source(creds: &Value, config: Option<&Value>, secret: &str) -> &'static str {
+    let jwt = creds
+        .get("zcodejwttoken")
+        .and_then(|v| v.as_str())
+        .and_then(|v| decrypt_credential(v, secret));
+    if jwt.filter(|t| t.trim().len() > 20).is_some() {
+        return "zcodejwt";
+    }
+    if quota::zai_billing_token(creds, config, secret).is_some() {
+        return "oauth";
+    }
+    "none"
+}
+
 fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
     if zcrypto::is_encrypted(v) {
         zcrypto::decrypt_with_secret(v, secret).ok()
     } else {
         Some(v.to_string())
     }
-}
-
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
-        .build()
 }
 
 pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
@@ -255,10 +266,7 @@ fn device_os_category() -> &'static str {
 }
 
 pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
-        .build();
+    let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
     for element in ACTIVATION_EVENTS {
         let body = activation_event_body(
             element,
@@ -266,16 +274,22 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
             user_id,
             device_mid,
         );
-        let resp = agent
-            .post(EVENT_REPORT_URL)
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(|e| {
-                crate::i18n::trf("err.claim.activate_req", &[("e", http_err("", e).trim())])
-            })?
-            .into_string()
-            .map_err(|e| crate::i18n::trf("err.claim.activate_req", &[("e", &e.to_string())]))?;
-        let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+        let payload = serde_json::to_string(&body).unwrap_or_default();
+        let resp = quota::zcode_http(
+            EVENT_REPORT_URL,
+            "POST",
+            &headers,
+            Some(&payload),
+            ACTIVATION_TIMEOUT_SECS,
+        )
+        .map_err(|e| crate::i18n::trf("err.claim.activate_req", &[("e", &e)]))?;
+        if !resp.ok() {
+            return Err(quota::http_status_error(
+                &crate::i18n::tr("err.claim.activate_req"),
+                &resp,
+            ));
+        }
+        let v: Value = quota::zcode_http_json(&resp)?;
         let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
         if code != 0 {
             return Err(failure_message(code, &v));
@@ -301,73 +315,19 @@ pub fn preview_plans(
     preview_once(&url, &token, device_mid)
 }
 
-fn http_err(prefix: &str, e: ureq::Error) -> String {
-    if let ureq::Error::Status(code, resp) = e {
-        let body = resp.into_string().unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|v| ["msg", "message", "error"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from)))
-            .unwrap_or_default();
-        return format!("{prefix} HTTP {code}: {msg}");
-    }
-    format!("{prefix} {e}")
-}
-
-/// claim 写请求的 HTTP 错误分类：401/403 若携带验证码挑战特征（响应头
-/// x-aliyun-captcha-verify-param 或 body 含 captcha 字样），归类为「需过人机校验」
-/// 而非凭证失效（zcode2api 实测教训：一次人机校验就把健康账号当登录过期会错杀）。
-fn classify_claim_http_err(prefix: &str, e: ureq::Error) -> ClaimError {
-    let status = match &e {
-        ureq::Error::Status(s, _) => *s,
-        _ => 0,
-    };
-    if status == 401 || status == 403 {
-        if let ureq::Error::Status(_, resp) = e {
-            let challenged = resp.header("x-aliyun-captcha-verify-param").is_some();
-            let body = resp.into_string().unwrap_or_default();
-            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            if challenged || body.to_lowercase().contains("captcha") {
-                return ClaimError {
-                    code: CLAIM_ERR_CHALLENGE,
-                    message: crate::i18n::tr("claim.fail.challenge"),
-                    next_at: None,
-                };
-            }
-            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-            if code > 0 {
-                return claim_error(code, &v);
-            }
-            let msg = ["msg", "message", "error"]
-                .iter()
-                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from))
-                .unwrap_or_default();
-            return ClaimError {
-                code: -1,
-                message: format!("{prefix} HTTP {status}: {msg}"),
-                next_at: None,
-            };
-        }
-    }
-    ClaimError {
-        code: -1,
-        message: http_err(prefix, e),
-        next_at: None,
-    }
-}
-
 fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
-    let mut req = agent().get(url);
-    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
-        req = req.set(&k, &v);
+    let headers = quota::zai_billing_headers_with_mid(token, mid);
+    let resp = quota::zcode_http(url, "GET", &headers, None, CLAIM_TIMEOUT_SECS)
+        .map_err(|e| crate::i18n::trf("err.claim.preview_req", &[("e", &e)]))?;
+    // 活动未上线时上游返回 404（zcode2api 2026-10-29 官方客户端 mitm 实测）：
+    // 属正常态，静默为空——否则「今天还没投放」会被渲染成「刷新失败」。
+    if resp.status == 404 {
+        return Ok(Vec::new());
     }
-    let resp = req
-        .call()
-        .map_err(|e| http_err(&crate::i18n::tr("err.claim.preview_req"), e))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    if !resp.ok() {
+        return Err(quota::http_status_error(&crate::i18n::tr("err.claim.preview_req"), &resp));
+    }
+    let v: Value = quota::zcode_http_json(&resp)?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(failure_message(code, &v));
@@ -385,16 +345,13 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
 /// 诊断用：原样返回上游 JSON（不解析、不降级）。用于排查「某账号为什么看不到活动 /
 /// 生效时间到底取哪个字段」。任何非 2xx 都以错误返回，便于看清 HTTP 码。
 fn fetch_raw_json(url: &str, token: &str, mid: Option<String>, prefix: &str) -> Result<Value, String> {
-    let mut req = agent().get(url);
-    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
-        req = req.set(&k, &v);
+    let headers = quota::zai_billing_headers_with_mid(token, mid);
+    let resp = quota::zcode_http(url, "GET", &headers, None, CLAIM_TIMEOUT_SECS)?;
+    if !resp.ok() {
+        return Err(quota::http_status_error(prefix, &resp));
     }
-    let resp = req
-        .call()
-        .map_err(|e| http_err(prefix, e))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    Ok(serde_json::from_str(&resp).unwrap_or(Value::String(resp)))
+    Ok(quota::zcode_http_json(&resp)
+        .unwrap_or_else(|_| Value::String(resp.body.clone())))
 }
 
 fn raw_token(home: &Path, creds: &Value, config: Option<&Value>) -> Result<String, String> {
@@ -476,19 +433,24 @@ pub fn marketing_touch_plans(
         Ok(t) => t,
         Err(e) => return fail(&e),
     };
-    let mut req = agent().get(&marketing_touch_url());
-    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
-        req = req.set(&k, &v);
-    }
-    let resp = match req.call() {
+    let headers = quota::zai_billing_headers_with_mid(&token, device_mid);
+    let resp = match quota::zcode_http(
+        &marketing_touch_url(),
+        "GET",
+        &headers,
+        None,
+        CLAIM_TIMEOUT_SECS,
+    ) {
         Ok(r) => r,
-        Err(e) => return fail(&http_err("marketing", e)),
+        Err(e) => return fail(&format!("marketing: {e}")),
     };
-    let resp = match resp.into_string() {
-        Ok(s) => s,
-        Err(e) => return fail(&crate::i18n::trf("err.http.read", &[("e", &e.to_string())])),
+    if !resp.ok() {
+        return fail(&quota::http_status_error("marketing", &resp));
+    }
+    let v: Value = match quota::zcode_http_json(&resp) {
+        Ok(v) => v,
+        Err(e) => return fail(&e),
     };
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::Null);
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
         return fail(&format!("code {}", v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1)));
     }
@@ -523,6 +485,7 @@ pub fn marketing_touch_plans(
             priority: 0,
             grants: vec![],
             grant_items: vec![],
+            effective_at: None,
             campaign: None,
         });
     }
@@ -770,16 +733,13 @@ pub fn fetch_active_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
-    let mut req = agent().get(&url);
-    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
-        req = req.set(&k, &v);
+    let headers = quota::zai_billing_headers_with_mid(&token, device_mid);
+    let resp = quota::zcode_http(&url, "GET", &headers, None, CLAIM_TIMEOUT_SECS)
+        .map_err(|e| crate::i18n::trf("err.claim.preview_req", &[("e", &e)]))?;
+    if !resp.ok() {
+        return Err(quota::http_status_error(&crate::i18n::tr("err.claim.preview_req"), &resp));
     }
-    let resp = req
-        .call()
-        .map_err(|e| http_err(&crate::i18n::tr("err.claim.preview_req"), e))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let v: Value = quota::zcode_http_json(&resp)?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(failure_message(code, &v));
@@ -805,21 +765,23 @@ pub fn fetch_active_plans(
                 starts_at: p.get("starts_at").and_then(|x| x.as_i64()).map(|s| s * 1000),
                 ends_at: p.get("ends_at").and_then(|x| x.as_i64()).map(|s| s * 1000),
                 // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），plan.starts_at 不是它
-                effective_at: p
-                    .get("entitlements")
-                    .and_then(|e| e.as_array())
-                    .and_then(|arr| {
-                        arr.iter()
-                            .filter_map(|it| it.get("effective_at").and_then(|x| x.as_i64()))
-                            .min()
-                    })
-                    .map(|s| s * 1000),
+                effective_at: entitlements_effective_at(p),
                 grant_items,
             })
         })
         .collect();
     out.sort_by(|a, b| b.ends_at.cmp(&a.ends_at).then(a.plan_id.cmp(&b.plan_id)));
     Ok(out)
+}
+
+/// 本次刷新的通道诊断：用于区分「服务端明确返回空」与「我们没拿到」。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimDiag {
+    pub preview_empty: bool,
+    pub marketing_empty: bool,
+    /// preview 通道本身的错误（marketing 兜底成功时仍然记录，供 UI 解释降级）
+    pub preview_error: Option<String>,
 }
 
 /// 可领套餐统一查询入口：billing/preview（错误上抛，保持既有报错体验）
@@ -830,9 +792,37 @@ pub fn collect_claimable_plans(
     config: Option<&Value>,
     device_mid: String,
 ) -> Result<Vec<ClaimPlan>, String> {
-    let plans = preview_plans(home, creds, config, Some(device_mid.clone()))?;
+    collect_claimable_plans_diag(home, creds, config, device_mid).map(|(plans, _)| plans)
+}
+
+/// 同上，但额外返回通道诊断（`claim_refresh` 用它解释空态）。
+pub fn collect_claimable_plans_diag(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: String,
+) -> Result<(Vec<ClaimPlan>, ClaimDiag), String> {
+    // 双通道互为兜底：preview 失败不立即整单失败，先看 marketing 有没有货
+    let (plans, preview_error) = match preview_plans(home, creds, config, Some(device_mid.clone())) {
+        Ok(p) => (p, None),
+        Err(e) => {
+            flowlog::log("claim", "preview-fail", &e);
+            (Vec::new(), Some(e))
+        }
+    };
     let extra = marketing_touch_plans(home, creds, config, Some(device_mid));
-    Ok(merge_marketing_plans(plans, extra))
+    // 两通道都没货且 preview 有错 → 保留既有报错体验（不吞真实故障）
+    if plans.is_empty() && extra.is_empty() {
+        if let Some(e) = &preview_error {
+            return Err(e.clone());
+        }
+    }
+    let diag = ClaimDiag {
+        preview_empty: plans.is_empty(),
+        marketing_empty: extra.is_empty(),
+        preview_error,
+    };
+    Ok((merge_marketing_plans(plans, extra), diag))
 }
 
 pub fn submit_claim(
@@ -849,29 +839,72 @@ pub fn submit_claim(
     }
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
-    let mut req = agent().post(&billing_claim_url());
-    for (k, v) in quota::zai_billing_headers_with_mid(&token, device_mid) {
-        req = req.set(&k, &v);
-    }
-    req = req.set("X-Aliyun-Captcha-Verify-Param", captcha_param.trim());
+    let mut headers = quota::zai_billing_headers_with_mid(&token, device_mid);
+    headers.push(("X-Aliyun-Captcha-Verify-Param".into(), captcha_param.trim().to_string()));
     if let Some(r) = captcha_region.filter(|r| !r.trim().is_empty()) {
-        req = req.set("X-Aliyun-Captcha-Verify-Region", r.trim());
+        headers.push(("X-Aliyun-Captcha-Verify-Region".into(), r.trim().to_string()));
     }
-    let resp = req
-        .send_json(serde_json::json!({ "plan_id": plan_id }))
-        .map_err(|e| classify_claim_http_err(&crate::i18n::tr("err.claim.claim_req"), e))?
-        .into_string()
-        .map_err(|e| ClaimError {
-            code: -1,
-            message: crate::i18n::trf("err.http.read", &[("e", &e.to_string())]),
-            next_at: None,
-        })?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let body = serde_json::json!({ "plan_id": plan_id }).to_string();
+    let resp = quota::zcode_http(
+        &billing_claim_url(),
+        "POST",
+        &headers,
+        Some(&body),
+        CLAIM_TIMEOUT_SECS,
+    )
+    .map_err(|e| ClaimError {
+        code: -1,
+        message: e,
+        next_at: None,
+    })?;
+    if !resp.ok() {
+        return Err(claim_error_from_resp(&crate::i18n::tr("err.claim.claim_req"), &resp));
+    }
+    let v: Value = quota::zcode_http_json(&resp).map_err(|e| ClaimError {
+        code: -1,
+        message: e,
+        next_at: None,
+    })?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         return Err(claim_error(code, &v));
     }
     Ok(v)
+}
+
+/// HTTP 非 2xx 的领取错误分类（等价于原 `classify_claim_http_err`，改为吃 HttpResp，
+/// 这样 curl/ureq 两条通道的响应头都能参与「人机校验」判定）。
+fn claim_error_from_resp(prefix: &str, resp: &quota::HttpResp) -> ClaimError {
+    if resp.status == 401 || resp.status == 403 {
+        let challenged = resp.header("x-aliyun-captcha-verify-param").is_some();
+        if challenged || resp.body.to_lowercase().contains("captcha") {
+            return ClaimError {
+                code: CLAIM_ERR_CHALLENGE,
+                message: crate::i18n::tr("claim.fail.challenge"),
+                next_at: None,
+            };
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&resp.body) {
+            let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            if code > 0 {
+                return claim_error(code, &v);
+            }
+            let msg = ["msg", "message", "error"]
+                .iter()
+                .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from))
+                .unwrap_or_default();
+            return ClaimError {
+                code: -1,
+                message: format!("{prefix} HTTP {}: {msg}", resp.status),
+                next_at: None,
+            };
+        }
+    }
+    ClaimError {
+        code: -1,
+        message: quota::http_status_error(prefix, resp),
+        next_at: None,
+    }
 }
 
 static CAPTCHA_CONFIG_CACHE: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, Option<CaptchaConfig>)>> =
@@ -923,16 +956,13 @@ pub fn reset_captcha_config_cache_for_tests() {
 }
 
 fn fetch_captcha_config_remote() -> Result<CaptchaConfig, String> {
-    let mut req = agent().get(&client_configs_url());
-    for (k, v) in quota::zai_billing_headers("") {
-        req = req.set(&k, &v);
+    let headers = quota::zai_billing_headers("");
+    let resp = quota::zcode_http(&client_configs_url(), "GET", &headers, None, CLAIM_TIMEOUT_SECS)
+        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e)]))?;
+    if !resp.ok() {
+        return Err(quota::http_status_error("captcha-config", &resp));
     }
-    let resp = req
-        .call()
-        .map_err(|e| crate::i18n::trf("err.claim.config_req", &[("e", &e.to_string())]))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.http.read", &[("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let v: Value = quota::zcode_http_json(&resp)?;
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
         return Err(crate::i18n::tr("err.claim.config_unavailable"));
     }
@@ -980,12 +1010,31 @@ fn parse_entitlements(p: &Value) -> Vec<ClaimGrant> {
         .unwrap_or_default()
 }
 
+/// 权益真实生效时间（ms）：`entitlements[].effective_at` 最小值，0 = 立即生效。
+/// 必须独立于 `parse_entitlements`（后者按 meter/unit_type/show_name 过滤，只用于额度展示）。
+/// `starts_at` 是活动开始时间，不参与这里的取值。
+pub(crate) fn entitlements_effective_at(p: &Value) -> Option<i64> {
+    p.get("entitlements")
+        .and_then(|e| e.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|it| {
+                    it.get("effective_at")
+                        .and_then(|x| x.as_i64())
+                        .or_else(|| it.get("effectiveAt").and_then(|x| x.as_i64()))
+                })
+                .min()
+        })
+        .map(|s| s * 1000)
+}
+
 fn parse_plan(p: &Value) -> Option<ClaimPlan> {
     let plan_id = str_field(p, "plan_id", "planId")?.trim().to_string();
     if plan_id.is_empty() {
         return None;
     }
     let grant_items = parse_entitlements(p);
+    let effective_at = entitlements_effective_at(p);
     let grants = grant_items
         .iter()
         .map(|g| {
@@ -1010,6 +1059,7 @@ fn parse_plan(p: &Value) -> Option<ClaimPlan> {
         plan_id,
         grants,
         grant_items,
+        effective_at,
         campaign: None,
     })
 }

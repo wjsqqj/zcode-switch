@@ -218,6 +218,15 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Ok(v) => v,
                 Err(e) => json!({ "error": e }),
             };
+            // 诊断命令：先把版本缓存刷新到最新（缓存新鲜时 refresh_cache 内部直接返回）
+            crate::changelog::refresh_cache(&paths.home);
+            let version = crate::changelog::version_status(&paths.home);
+            let token_source = crate::claim::token_source(
+                &acc.credentials,
+                acc.config.as_ref(),
+                &crate::zcrypto::default_secret(&paths.home),
+            );
+            let masked_mid = if mid.len() > 8 { format!("{}…", &mid[..8]) } else { mid.clone() };
             let mut out = serde_json::Map::new();
             if want("preview") {
                 out.insert(
@@ -252,6 +261,22 @@ pub fn run(args: &[String]) -> (String, i32) {
                     )),
                 );
             }
+            // 「为什么看不到活动」的自助诊断：版本 / token 来源 / 设备号（掩码）一次给全，不含 token
+            out.insert(
+                "_meta".into(),
+                json!({
+                    "accountName": acc.name,
+                    "appVersion": version.reported,
+                    "latestVersion": version.latest,
+                    "bundledVersion": version.bundled,
+                    "versionStale": version.stale,
+                    "constantBehind": version.constant_behind,
+                    "userAgent": format!("ZCode/{}", version.reported),
+                    "tokenSource": token_source,
+                    "hasZcodeJwt": token_source == "zcodejwt",
+                    "deviceMidMasked": masked_mid,
+                }),
+            );
             ok(Value::Object(out))
         }
         // 诊断用：查该账号「已生效」的套餐（billing/current）+ 本地领取历史。
@@ -268,6 +293,8 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Ok(m) => m,
                 Err(e) => return (err(&e), 1),
             };
+            // 重登会换 accountId：历史按 userId 兜底匹配
+            let user_id = crate::zcrypto::account_identity(&acc.credentials, &paths.home).user_id;
             match crate::claim::fetch_active_plans(
                 &paths.home,
                 &acc.credentials,
@@ -277,8 +304,9 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Ok(plans) => ok(json!({
                     "id": acc.id,
                     "name": acc.name,
+                    "userId": user_id,
                     "plans": plans,
-                    "history": claim_history_for(&paths, &id),
+                    "history": claim_history_for(&paths, &id, user_id.as_deref()),
                 })),
                 Err(e) => return (err(&e), 1),
             }

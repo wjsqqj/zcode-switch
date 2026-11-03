@@ -277,7 +277,20 @@ pub(crate) fn claim_history_file(paths: &Paths) -> PathBuf {
 }
 
 /// 领取成功后追加一条历史（仅套餐元数据，不含凭证）。失败静默（best-effort）。
-pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &str, plan_name: &str) {
+///
+/// `starts_at` / `ends_at` / `effective_at` 单位均为毫秒。`effective_at` 是权益真实生效时刻
+/// （`entitlements[].effective_at`，0 = 立即生效），**不是** `starts_at`；缺一不可地用 `Option`
+/// 落成 `null`，老版本前端读到 `null` 会退化为「时间未记录」。
+pub(crate) fn record_claim_history(
+    paths: &Paths,
+    account_id: &str,
+    user_id: Option<&str>,
+    plan_id: &str,
+    plan_name: &str,
+    starts_at: Option<i64>,
+    ends_at: Option<i64>,
+    effective_at: Option<i64>,
+) {
     let file = claim_history_file(paths);
     let mut items: Vec<Value> = fs::read_to_string(&file)
         .ok()
@@ -286,9 +299,13 @@ pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &st
     let now_ms = Local::now().timestamp_millis();
     items.push(serde_json::json!({
         "accountId": account_id,
+        "userId": user_id,
         "planId": plan_id,
         "planName": plan_name,
         "claimedAt": now_ms,
+        "startsAt": starts_at,
+        "endsAt": ends_at,
+        "effectiveAt": effective_at,
     }));
     // 只保留最近 200 条，防无限增长
     if items.len() > 200 {
@@ -299,14 +316,26 @@ pub(crate) fn record_claim_history(paths: &Paths, account_id: &str, plan_id: &st
 }
 
 /// 读取某账号的领取历史（文件损坏/缺失视为空）。
-pub(crate) fn claim_history_for(paths: &Paths, account_id: &str) -> Vec<Value> {
+///
+/// 匹配规则：`accountId` 命中，**或** `userId` 命中。
+/// 后者用于「退出后重新登录」——重登会生成新的 accountId，只按 accountId 查会让已领取记录凭空消失。
+pub(crate) fn claim_history_for(paths: &Paths, account_id: &str, user_id: Option<&str>) -> Vec<Value> {
     let items: Vec<Value> = fs::read_to_string(claim_history_file(paths))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
+    let uid = user_id.map(str::trim).filter(|s| !s.is_empty());
     items
         .into_iter()
-        .filter(|it| it.get("accountId").and_then(|v| v.as_str()) == Some(account_id))
+        .filter(|it| {
+            if it.get("accountId").and_then(|v| v.as_str()) == Some(account_id) {
+                return true;
+            }
+            match (it.get("userId").and_then(|v| v.as_str()), uid) {
+                (Some(a), Some(b)) => !a.is_empty() && a == b,
+                _ => false,
+            }
+        })
         .collect()
 }
 
@@ -1668,4 +1697,78 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_paths() -> Paths {
+        let home = std::env::temp_dir().join(format!("zsw-store-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(home.join(".zcode-switch")).unwrap();
+        Paths { home: home.clone(), data_root: home }
+    }
+
+    /// 老版本历史（无时间字段）必须可读；新记录要带 startsAt/endsAt/effectiveAt。
+    #[test]
+    fn claim_history_records_times_and_keeps_legacy_entries() {
+        let paths = temp_paths();
+        let legacy = json!([{
+            "accountId": "a1", "planId": "p-old", "planName": "OLD", "claimedAt": 1
+        }]);
+        fs::write(claim_history_file(&paths), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        record_claim_history(
+            &paths,
+            "a1",
+            Some("user-1"),
+            "zcode-v3-start-plan-1103",
+            "ZCODE GLOBAL BUILD",
+            Some(1_793_012_400_000),
+            Some(1_793_062_800_000),
+            Some(1_793_026_800_000),
+        );
+
+        let items = claim_history_for(&paths, "a1", Some("user-1"));
+        assert_eq!(items.len(), 2, "老记录必须保留，不能被覆盖清空");
+        assert_eq!(items[0]["planId"], "p-old");
+        let it = &items[1];
+        assert_eq!(it["planId"], "zcode-v3-start-plan-1103");
+        assert_eq!(it["userId"], "user-1");
+        assert_eq!(it["startsAt"], 1_793_012_400_000i64);
+        assert_eq!(it["endsAt"], 1_793_062_800_000i64);
+        assert_eq!(it["effectiveAt"], 1_793_026_800_000i64);
+        assert!(it["claimedAt"].as_i64().unwrap() > 0);
+        let _ = fs::remove_dir_all(&paths.home);
+    }
+
+    /// 退出重登会生成新的 accountId：同一 userId 必须仍能查到历史。
+    #[test]
+    fn claim_history_survives_relogin_by_user_id() {
+        let paths = temp_paths();
+        record_claim_history(
+            &paths,
+            "old-account-id",
+            Some("user-42"),
+            "zcode-v3-start-plan-1103",
+            "ZCODE GLOBAL BUILD",
+            None,
+            None,
+            Some(1_793_026_800_000),
+        );
+
+        // 重登后新 accountId，但 userId 相同
+        let by_user = claim_history_for(&paths, "new-account-id", Some("user-42"));
+        assert_eq!(by_user.len(), 1, "同一 userId 必须命中重登前的记录");
+
+        // 老记录（无 userId）只按 accountId 命中
+        record_claim_history(&paths, "legacy-id", None, "p-old", "OLD", None, None, None);
+        assert_eq!(claim_history_for(&paths, "legacy-id", None).len(), 1);
+        assert_eq!(
+            claim_history_for(&paths, "another-id", Some("user-42")).len(),
+            1,
+            "无 userId 的老记录不得被其他账号命中"
+        );
+        let _ = fs::remove_dir_all(&paths.home);
+    }
 }

@@ -56,6 +56,9 @@ pub const CLIENT_APP_VERSION: &str;          // 最新已知 ZCode 客户端版�
 | 条件 | 行为 |
 |---|---|
 | preview 网络错误/HTTP 非 0 | `Err` 上抛（claim_preview/claim_refresh/claim_start 现有报错链路） |
+| preview **HTTP 404** | `Ok(vec![])` 静默（活动未上线属正常态，2026-11-03 起；见 §10.4） |
+| preview 报错 + marketing 有货 | **降级成功**：返回 marketing 结果，`diag.preview_error` 记录原错误（2026-11-03 起） |
+| preview 报错 + marketing 也空 | `Err` 上抛（不把故障吞成「没有活动」） |
 | marketing 网络/code!=0/JSON 解析失败 | `flowlog::log("claim", "marketing-fail", detail)` + 返回 `[]`，**不弹 toast、不影响 preview 结果** |
 | 本机无 ZCode 客户端（注册表探测失败） | 上报 `CLIENT_APP_VERSION`（3.16.3） |
 | 本机客户端版本 < 常量 | 上报常量；> 常量 → 上报真实版本 |
@@ -124,14 +127,142 @@ impl ClaimError {
 ## 10. 已领取状态（2026-10-24 补充，任务 10-24-claimed-state）
 
 - `fetch_active_plans` → `GET billing/current`（`data.plans[{user_plan_id,plan_id,name,status,starts_at,ends_at,entitlements}]`，秒级时间戳×1000 转 ms）。
-- **时间语义（2026-10-26 实测补充）**：`plan.starts_at` 是活动/计划开始时间，**不是生效时间**；真正生效时间在 `entitlements[].effective_at`（样例：`ZCODE GLOBAL BUILD` 的 `starts_at=19:15:53`、`entitlements[0].effective_at=23:00:00`、`ends_at=次日 09:00`）。任何「生效时间」展示必须优先 `effective_at`，其次 `starts_at`，都没有标「未提供」。
 - **诊断命令**：`--cli claim-current --id` 查已生效套餐 + 本地历史；`--cli claim-raw --id [--only preview|marketing|current]` 原样打印上游 JSON（排查「为什么这个账号看不到活动」）。实测：服务端对无资格账号两通道均返回 `code=0` 且数组为空，**不提供原因字段**，本地不得据此编造原因。
-- 领取成功落 `claim-history.json`（200 条滚动，仅元数据）；`claim_current(id)` 命令返回 `{plans, history}`；current 失败前端静默。
 - preview 为空 ≠ 无活动（可能已领取）——用 current + 历史区分。
+
+### 10.1 生效时间契约（2026-11-03 修正，任务 11-03-claim-effective-time-display）
+
+**时间语义（再次强调，2026-10-26 首次实测、2026-11-03 因线上回归重写）**：`plan.starts_at` 是活动/计划开始时间，**永远不是生效时间**；真正生效时间在 `entitlements[].effective_at`（样例：`ZCODE GLOBAL BUILD` 的 `starts_at=19:15:53`、`entitlements[0].effective_at=23:00:00`、`ends_at=次日 09:00`）。
+
+**签名**
+
+```rust
+// claim.rs
+pub struct ClaimPlan { /* … */ pub effective_at: Option<i64> }  // ms；0 = 立即生效；None = 未下发
+pub(crate) fn entitlements_effective_at(p: &Value) -> Option<i64>; // entitlements[].effective_at 取 min ×1000
+// store.rs
+pub(crate) fn record_claim_history(paths, account_id, user_id: Option<&str>, plan_id, plan_name,
+    starts_at: Option<i64>, ends_at: Option<i64>, effective_at: Option<i64>);
+```
+
+**契约**
+
+- 三个入口（`billing/claim` 领取响应、`billing/current`、`marketing/touch` 内嵌 `zcode_plan`）**共用** `entitlements_effective_at()`，禁止任一处再内联 `min()`。
+- `parse_entitlements()` 只负责额度展示（按 `meter/unit_type/show_name` 过滤），**不能**用它取生效时间。
+- `claim-history.json` 每条：`{accountId, planId, planName, claimedAt, startsAt, endsAt, effectiveAt}`（全部 ms）。老文件只有前四个字段，读取端必须容忍缺失。
+- 前端唯一语义实现：`src/claim-time.js`（`fmtDateTime` / `parseEffectiveFromCopy` / `resolveEffective` / `rangeOf` / `effectiveDetail`）。`main.js` 与 `ui.js` 禁止各写一份时间格式化或 `effectiveAt ?? startsAt`。
+- 取值优先级：`effective_at` 字段 → 活动正文解析（仅含「生效」的句段、取「生效」前最近时间）→ `null`。文案兜底必须在 UI 标注「（据活动说明）」。
+- 时间格式统一 `YYYY-MM-DD HH:mm`（带年份）。
+- `claim-current` 在本机实测可返回 `{"code":0}` **无 `data`**：已领套餐可能尚未进入 current，此时唯一来源是本地历史/持久化目录。
+
+**验证矩阵**
+
+| 条件 | 行内/汇总条 | 详情「生效时间」 |
+|---|---|---|
+| `effective_at` 存在且 > now | `待生效 X → 至 Y` | `X` |
+| `effective_at` 存在且 ≤ now / `0` | `生效 X → 至 Y` / `立即生效` | `X` / `立即生效` |
+| 只有文案解析值且 > now | `预计生效 X → 至 Y` | `预计 X 生效（据活动说明）` |
+| 都没有，但有 `starts_at` | `活动 A → 至 Y`（**不得写「生效」**） | `领取后确认` |
+| 历史记录缺时间 | `已领取过 X（时间未记录）` | — |
+
+**测试**
+
+- `mock_upstream::marketing_plan_parses_entitlement_effective_at`：多 entitlement 取 min、×1000、与 `starts_at` 无关。
+- `mock_upstream::marketing_plan_without_effective_at_stays_none`：缺失必须是 `None`，不得回退 `starts_at`。
+- `mock_upstream::current_parses_active_plans`：current 的 `effective_at` 取自 entitlement。
+- `store::tests::claim_history_records_times_and_keeps_legacy_entries`：老记录保留 + 新字段落盘。
+- `scripts/test-claim-time.mjs`（`npm test`）：格式、文案解析边界（非法日期、开始/生效同句、无年份跨年）、取值优先级、三态判定。
+
+**Wrong / Correct**
+
+```js
+// Wrong：把活动开始当生效时间，线上表现「生效 11/03 19:00」，而真实生效是 23:00
+const startMs = p.effective_at ?? p.starts_at ?? null;
+t("act.timeRange", { start: fmt(startMs), end: fmt(p.ends_at) });
+
+// Correct：生效只认 effective_at，starts_at 单独走「活动」文案
+const g = rangeOf({ startsAt, endsAt, effectiveAt: eff.at, effectiveSource: eff.source });
+t(ACT_RANGE_KEYS[g.kind], { start: fmt(g.startMs), end: fmt(g.endMs) });
+```
+
+> **Warning**：`effective_at` 的 `0` 是合法值（立即生效），前端判断必须用 `!= null`，不能用真值判断。
+
+### 10.2 领取历史归属与重登兼容（2026-11-03 补充）
+
+**问题（实测）**：退出后重新登录会生成**新的 accountId**（同一用户 `52a7232d…` → `9907b4bb…`），历史只按 `accountId` 查会导致「已领取记录凭空消失」，表现为「重登后刷不到活动」。
+
+**契约**
+
+- 落盘字段：`{accountId, userId, planId, planName, claimedAt, startsAt, endsAt, effectiveAt}`；`userId` 取自 `zcrypto::account_identity(creds, home).user_id`（oauth `user_info.id` 或 JWT `sub`）。
+- 读取匹配：`accountId` **或** `userId` 命中即返回；任一侧为空/缺失时只走 `accountId`（老文件天然兼容）。
+- 所有调用点（`claim_current`、`--cli claim-current`、冷却分支）都必须传 userId，漏传即退化回旧行为。
+
+**为什么不做「按 planId 全局匹配」**：同一活动会被多个用户领取，按 planId 匹配会把别人的记录算到本账号头上。
+
+**验证**：`store::tests::claim_history_survives_relogin_by_user_id`（同 userId 不同 accountId 必须命中；无 userId 的老记录不得被其他账号命中）。
+
+### 10.2.1 余额推断「已领取」（2026-11-03 补充，任务 claimed-inference-by-tier）
+
+**实测**（新账号 fbnmmsij vs 已领账号旅行者2151）：
+
+| 账号 | `billing/current` | `billing/balance` |
+|---|---|---|
+| 未领取 | 空 | `is_empty=true, plan_tier=null, source=no_plan` |
+| 已领取（权益未生效） | **空（无 data）** | `plan_tier="Start Plan"`, `tier_code="start"`, `plans[0].name="ZCODE GLOBAL BUILD"` |
+
+- 领取后活动从 `marketing`/`preview`/`current` 全部消失，但 **balance 仍保留活动套餐名与 `start` 等级**；官方 3.17.2 客户端显示「已领取过」正是靠它（3.17.2 asar 的 API 路径与 3.16.3 完全一致，没有新接口）。
+- 前端契约：`fetchClaimed` 在 `current.plans` 为空时调用 `get_account_quota`，只采纳 `tier_code == "start"`（或 tier 含 start）的套餐，存 `claimedState[id].quotaPlans`；10 分钟节流（`hintAt`），失败静默。
+- 渲染：活动面板补 `status=claimed` 行（无时间），行内条显示「已领取（待生效）」；**不写入** `claim-history.json`（推断不得污染真实历史）。
+- 禁止把非 start 套餐（Coding/Pro）当活动记录；也禁止用它阻断领取（服务端仍是唯一裁决者）。
+
+---
+
+### 10.3 活动下发可见性：版本与空态诊断（2026-11-03 补充）
+
+**实测结论**（3 个账号 + 官方 token/deviceMid 对照）：`marketing/touch` 与 `billing/preview` 在「已领取 / 无资格」时都返回 `code=0` 且空数组，**不提供原因**；`billing/current` 在权益生效前也不返回待生效套餐。所以「刷不出来」必须在本地给出可解释信息，而不是静默空白。
+
+**版本链路**
+
+| 项 | 值 / 行为 |
+|---|---|
+| `CLIENT_APP_VERSION` | `3.17.2`（2026-11-03 官方最新；常量必须随官方发版更新） |
+| changelog TTL | `6h`（原 24h；活动按客户端版本下发，版本越新越好） |
+| 保鲜入口 | `claim_refresh` / `claim_preview` / `activity_probe` / `version_status` 调 `changelog::ensure_fresh(home)` |
+| 保鲜纪律 | `ensure_fresh` **只 spawn 后台线程**（进程内 60s 节流），请求线程零网络 IO（见 §12.1） |
+| 上报版本 | `max(本机探测, CLIENT_APP_VERSION, changelog 缓存)`；因此 reported 不可能小于 latest |
+
+**`VersionStatus`（camelCase 序列化）**
+
+```rust
+pub struct VersionStatus {
+    pub reported: String,        // 实际上报
+    pub latest: Option<String>,  // changelog 缓存
+    pub stale: bool,             // 缓存缺失/超 6h → reported 可能落后
+    pub cache_age_secs: Option<u64>,
+    pub client_constant: String,
+    pub constant_behind: bool,   // 常量 < latest → 该发新版了
+}
+```
+
+- `claim_refresh` 返回体新增 `version`；UI 在 `stale || constantBehind` 时**每会话提示一次**（不刷屏）。
+- 空态文案必须包含：上报版本 / 官方最新 / `stale` 或 `constantBehind` 的具体原因 / 「官方客户端领取的记录本工具无法同步」。
+- `--cli claim-raw` 输出 `_meta`：`appVersion / latestVersion / versionStale / constantBehind / userAgent / tokenSource(zcodejwt|oauth|none) / hasZcodeJwt / deviceMidMasked / accountName`，**禁止输出 token 明文**。
+
+### 10.4 活动投放窗口与 404 语义（2026-11-03 补充，参考 zcode2api 2.7.10）
+
+- **投放窗口**：官方活动/套餐按天投放，通常北京时间 **19:00 后放量**（zcode2api 用户侧情报；2026-11-03 实测 19:42 仍可 preview 到当天活动，领取后转空）。19:00 前刷空属正常态，活动面板空态必须说明。
+- **preview 404**：活动未上线时上游返回 404 → `preview_once` 返回 `Ok(vec![])`，不得上抛。`raw_preview`（`--cli claim-raw`）保持原样，便于查看真实响应。
+- **禁止扩散**：404 静默只允许存在于 preview 读路径；`submit_claim` 的任何失败必须报错。
+- **渠道值**：`X-Release-Channel = production`（官方 bundle 实测）；`stable` 是 3.11.2 时代遗留值。
 
 ## 11. 版本链与测试旁路（2026-10-24 补充，任务 changelog-version / mock-upstream-tests）
 
-- 上报版本 = `max(注册表探测, changelog 缓存最新, CLIENT_APP_VERSION 常量)`；changelog 缓存 `{home}/.zcode-switch/changelog-cache.json`（24h TTL，启动后台线程保鲜，请求只读缓存）；版本提取只认 `Release v3.x.y` / `releases/3.x.y/` 锚点（页面 SVG path 坐标与千分位数字会产生 57.787.384 类假阳性）。
+- 上报版本 = `max(注册表探测, 安装包内置快照, changelog 缓存最新, CLIENT_APP_VERSION 常量)`（四层，2026-11-03 增快照）。
+  - 内置快照：`src-tauri/resources/known-latest.json`（`{version, generated_at}`），由 `scripts/dist.mjs` 在每次打包前刷新（优先本机 changelog 缓存，其次线上页面），随安装包分发；运行时按 `exe 同目录 → resources/` 查找，坏 JSON/缺失一律 None。用途：换机/缓存被清/首次离线时不再退回旧常量。
+  - changelog 缓存 `{home}/.zcode-switch/changelog-cache.json`（**6h TTL**（2026-11-03 由 24h 收紧））。
+  - 保鲜时机：启动线程内若缓存**缺失**则同步拉一次（3s 硬超时），否则走 TTL；每次刷新活动 `ensure_fresh` 在缓存**缺失**时同步等一次（2s 硬超时），**过期仍走后台**（60s 节流）——禁止每次刷新都等网络。
+  - 版本提取只认 `Release v3.x.y` / `releases/3.x.y/` 锚点（页面 SVG path 坐标与千分位数字会产生 57.787.384 类假阳性）。
+  - 诊断：`VersionStatus.bundled` 与 `--cli claim-raw` 的 `_meta.bundledVersion` 指明上报值是否来自快照。
 - 测试旁路：`ZCODE_API_BASE`（claim 全部端点）、`ZCODE_CHANGELOG_URL`；URL 由 `claim.rs` 的 `billing_*_url()/client_configs_url()/marketing_touch_url()` 函数拼出，禁止再引入硬编码 URL 常量。
 - mock 测试：`src-tauri/tests/support/mod.rs`（TcpListener 最小 HTTP，非阻塞 accept + 轮询 shutdown，否则 Drop join 死锁）；用例在 `tests/mock_upstream.rs`，env 相关用例必须持 `ENV_LOCK` 串行。
 
@@ -150,6 +281,9 @@ impl ClaimError {
 | 3007 验证码失败 | `X-Aliyun-Captcha-Verify-Region` 缺失/与参数不同源 | 参数与地区必须成套；参数还要求「原样 JSON 字符串」，被二次序列化同样报 3007 |
 | 3001 参数错误 | `X-Platform=win32` 之类平台值与客户端不一致 | `billing/preview` 容错、`client/configs` 直接拒 |
 | preview 恒空 / 无活动 | `X-ZCode-App-Version` 落后 | 版本门槛会过滤活动；必须取 `max(本机探测, 最新已知)` |
+| preview 404（活动未上线） | 正常态 | 静默为空，**不要**渲染成「刷新失败」；见 §10.4 |
+| 活动 19:00 前刷不到 | 正常态 | 官方按天投放，通常北京时间 19:00 后放量；见 §10.4 |
+| 指纹与官方客户端不一致 | `X-Release-Channel` 值过时 | 官方为 `production`（`stable` 是 3.11.2 时代遗留） |
 | 401 空体 | 用了 oauth access_token 而非 `zcodejwttoken` | 领取链路只认 `zcodejwttoken` |
 | 3012 / unusual activity | 出口 IP 与验证码求解不一致、请求过于规律 | 见 §9 退避；求解与 claim 必须同出口 |
 | 幂等异常 | `X-Device-Mid` 每次变化 | 每账号必须稳定复用同一 mid |
@@ -247,3 +381,47 @@ impl ClaimError {
 - `risk::tests::observe_hits_3012_blocked_payload`：`unusual activity` + `provider_code=3012` + `status=405` 报文 → 记 strike、首次 ~900s、二次 ~1800s。
 - `mock_upstream::preview_blocked_unusual_activity_3012_surfaces_error`：同上报文经 405 返回时错误上抛且保留 `405` 与 `unusual activity` 文本（供 `observe_upstream_failure` 命中）。
 - `risk` 单元测试会设置进程级 `ZCODE_SWITCH_HOME`，**必须持 `TEST_LOCK` 串行**，否则并行测试互相覆盖 home 导致偶发失败（本次一并修复）。
+
+### 12.5 zcode.z.ai 请求层纪律（2026-11-03 补充，移植 PR#43）
+
+**签名**
+
+```rust
+// quota.rs
+pub(crate) struct HttpResp { pub status: u16, pub body: String, pub headers: Vec<(String, String)> }
+pub(crate) fn curl_http(url, method, headers, body, timeout_secs) -> Result<HttpResp, String>;
+pub(crate) fn ureq_http(url, method, headers, body, timeout_secs) -> Result<HttpResp, String>;
+pub(crate) fn zcode_http(url, method, headers, body, timeout_secs) -> Result<HttpResp, String>;
+pub(crate) fn http_status_error(prefix, &HttpResp) -> String;
+```
+
+**契约**
+
+- 所有 `zcode.z.ai` 请求统一走 `zcode_http()`（curl 优先、ureq+native-tls 兜底）；**禁止**在 claim/quota 各写一份 `AgentBuilder` 直连该域。
+- 传输层判定：2xx 但 body 为空 / 非 JSON → 视为传输失败并换通道；**4xx/5xx 属有语义响应**，交调用方（404=未投放静默、401/403=挑战）。
+- 凭据只经 stdin（`curl -K -`）传递，禁止出现在 argv；`dump-header` 的临时文件读完即删。
+- `open.bigmodel.cn` 额度接口保持 ureq 直连与原 429 退避，不经过弹性层。
+- 版本号三级回退：注册表 `DisplayVersion` → `settings.zcode_path` 的 exe `ProductVersion` → `max(CLIENT_APP_VERSION, changelog 缓存)`。
+
+**为什么**：WAF 会按 TLS 指纹/时段策略性返回 2xx 空 body；把「空」当「无数据」会制造假阴性（PR#43 的核心结论）。本机三栈对照未复现该差异（ureq/curl/node 同为空），弹性层属**跨环境保险**而非本地解药。
+
+**测试**
+
+- `quota::http_tests::curl_http_reads_local_mock`：curl 直连本地 mock，解析状态码/body/头。
+- `quota::http_tests::zcode_http_rejects_empty_body`：2xx 空 body → 两通道都失败 → `Err`。
+- `quota::http_tests::zcode_http_returns_404_as_response`：404 原样返回（preview 静默依赖）。
+- 既有 `preview_404_is_treated_as_empty` / `preview_500_still_errors` 必须继续通过。
+
+#### Wrong vs Correct
+
+```rust
+// Wrong：直接 ureq 打活动接口，空 body 被当成「没有活动」
+let resp = ureq::AgentBuilder::new().build().get(&url).call()?;
+let v: Value = serde_json::from_str(&resp.into_string()?).unwrap_or(Value::Null);
+
+// Correct：统一弹性层，空 body 视为传输失败并换通道
+let resp = quota::zcode_http(&url, "GET", &headers, None, 25)?;
+if resp.status == 404 { return Ok(Vec::new()); }
+if !resp.ok() { return Err(quota::http_status_error("preview", &resp)); }
+let v = quota::zcode_http_json(&resp)?;
+```

@@ -284,6 +284,7 @@ async fn get_account_quota(id: String, force: Option<bool>) -> Result<quota::Quo
 async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
     run_blocking(move || {
         let paths = Paths::detect();
+        changelog::ensure_fresh(&paths.home);
         // 冷却期零上游流量：preview 也是 billing 请求，必须一起挡住
         if risk::is_cooling(&paths, &id) {
             let mins = (risk::cooling_remaining_secs(&paths, &id) + 59) / 60;
@@ -307,26 +308,40 @@ struct ClaimCurrentResult {
     history: Vec<Value>,
 }
 
+/// 版本诊断：UI 在打开活动面板 / 刷新活动后调用，用于解释「为什么服务端没下发活动」。
+/// 缓存过期会顺手起一个后台刷新线程，本命令只读本地状态，不做同步网络 IO。
+#[tauri::command]
+async fn version_status() -> Result<changelog::VersionStatus, String> {
+    run_blocking(move || {
+        let paths = Paths::detect();
+        changelog::ensure_fresh(&paths.home);
+        Ok(changelog::version_status(&paths.home))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
     run_blocking(move || {
         let paths = Paths::detect();
+        let acc = load_account(&paths, &id)?;
+        // 退出重登会换 accountId：历史同时按 userId 匹配，否则已领取记录会凭空消失
+        let user_id = zcrypto::account_identity(&acc.credentials, &paths.home).user_id;
         // 冷却期零上游流量：current 只回本地历史，不发上游请求（避免冷却被反复刷新击穿）
         if risk::is_cooling(&paths, &id) {
             return Ok(ClaimCurrentResult {
                 plans: Vec::new(),
-                history: store::claim_history_for(&paths, &id),
+                history: store::claim_history_for(&paths, &id, user_id.as_deref()),
             });
         }
         let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-        let acc = load_account(&paths, &id)?;
         let plans =
             claim::fetch_active_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
                 .map_err(|e| {
                     risk::observe_upstream_failure(&paths, &id, &e);
                     e
                 })?;
-        let history = store::claim_history_for(&paths, &id);
+        let history = store::claim_history_for(&paths, &id, user_id.as_deref());
         Ok(ClaimCurrentResult { plans, history })
     })
     .await
@@ -338,12 +353,18 @@ struct ClaimRefreshResult {
     plans: Vec<claim::ClaimPlan>,
     activated: bool,
     activation_error: Option<String>,
+    /// 本次刷新的通道诊断：preview/marketing 是否「服务端明确返回空」
+    diag: claim::ClaimDiag,
+    /// 本次刷新时的客户端版本诊断：活动按 X-ZCode-App-Version 下发，版本落后会被过滤
+    version: changelog::VersionStatus,
 }
 
 #[tauri::command]
 async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
     run_blocking(move || {
         let paths = Paths::detect();
+        // 每次刷新活动都检查版本是否最新（缓存过期则后台重拉，不阻塞本次请求）
+        changelog::ensure_fresh(&paths.home);
         let mid = store::ensure_virtual_device_mid(&paths, &id)?;
         let acc = load_account(&paths, &id)?;
         if risk::is_cooling(&paths, &id) && !force.unwrap_or(false) {
@@ -358,13 +379,23 @@ async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshRe
                 },
                 None => (false, None),
             };
-        let plans =
-            claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
-                .map_err(|e| {
-                    risk::observe_upstream_failure(&paths, &id, &e);
-                    e
-                })?;
-        Ok(ClaimRefreshResult { plans, activated, activation_error })
+        let (plans, diag) = claim::collect_claimable_plans_diag(
+            &paths.home,
+            &acc.credentials,
+            acc.config.as_ref(),
+            mid,
+        )
+        .map_err(|e| {
+            risk::observe_upstream_failure(&paths, &id, &e);
+            e
+        })?;
+        Ok(ClaimRefreshResult {
+            plans,
+            activated,
+            activation_error,
+            diag,
+            version: changelog::version_status(&paths.home),
+        })
     })
     .await
 }
@@ -464,32 +495,35 @@ async fn claim_captcha_submit(
                     .pointer("/data/server_time")
                     .and_then(|x| x.as_i64())
                     .map(|s| s * 1000);
-                // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），starts_at 只是活动开始
+                // 权益真正生效的时刻在 entitlement 上（0 = 立即生效），starts_at 只是活动开始。
+                // 与 marketing/current 共用同一抽取逻辑，避免三处各写一份再漂移。
                 let effective_at = v
-                    .pointer("/data/plan/entitlements")
-                    .and_then(|e| e.as_array())
-                    .and_then(|arr| {
-                        arr.iter()
-                            .filter_map(|it| it.get("effective_at").and_then(|x| x.as_i64()))
-                            .min()
-                    })
-                    .map(|s| s * 1000);
+                    .pointer("/data/plan")
+                    .and_then(claim::entitlements_effective_at);
+                let starts_at = ms("starts_at");
+                let ends_at = ms("ends_at");
                 let outcome = claim::ClaimOutcome {
                     account_id: pending.account_id.clone(),
                     account_name: pending.account_name.clone(),
                     plan_name: pending.plan_name.clone(),
-                    starts_at: ms("starts_at"),
-                    ends_at: ms("ends_at"),
+                    starts_at,
+                    ends_at,
                     effective_at,
                     server_time,
                 };
                 let p = serde_json::to_value(&outcome).unwrap_or(Value::Null);
-                // 领取成功落历史（best-effort），供「已领取生效中」展示
+                // 领取成功落历史（best-effort），供「已领取」条展示「生效 → 结束」区间。
+                // userId 必须一起落：退出重登会换 accountId，只按 accountId 查会丢失记录。
+                let user_id = zcrypto::account_identity(&pending.credentials, &paths.home).user_id;
                 store::record_claim_history(
                     &paths,
                     &pending.account_id,
+                    user_id.as_deref(),
                     &pending.plan_id,
                     &pending.plan_name,
+                    starts_at,
+                    ends_at,
+                    effective_at,
                 );
                 let _ = app2.emit("claim://result", &p);
                 p
@@ -539,6 +573,7 @@ struct ActivityProbeResult {
 async fn activity_probe(ids: Vec<String>) -> Result<ActivityProbeResult, String> {
     run_blocking(move || {
         let paths = Paths::detect();
+        changelog::ensure_fresh(&paths.home);
         let mut items = Vec::new();
         let mut skipped = Vec::new();
         for id in ids {
@@ -1725,6 +1760,7 @@ pub fn run() {
             claim_preview,
             claim_refresh,
             claim_current,
+            version_status,
             claim_start,
             claim_captcha_config,
             claim_captcha_submit,
@@ -1782,7 +1818,15 @@ pub fn run() {
             }
             {
                 let home = Paths::detect().home;
-                std::thread::spawn(move || changelog::refresh_cache(&home));
+                std::thread::spawn(move || {
+                    // 缓存从未成功拉取（首次安装 / 被清理）：同步拉一次（3s 硬超时），
+                    // 避免第一次刷新活动还用编译期常量；已有缓存则走 TTL 判定。
+                    if changelog::cached_latest(&home).is_none() {
+                        changelog::refresh_cache_with_timeout(&home, 3);
+                    } else {
+                        changelog::refresh_cache(&home);
+                    }
+                });
             }
             // macOS 主窗以隐藏、透明创建（tauri.macos.conf.json）：先铺原生底色再显示，避免首帧露出桌面
             if let Some(main) = app.get_webview_window("main") {
