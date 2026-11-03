@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [Release CI](./release-ci.md) | 发版矩阵/镜像/校验和/重发同版本的操作契约 | 打 tag、改 release workflow、macOS 构建异常 |
 
 ---
 
