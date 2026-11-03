@@ -17,9 +17,11 @@ jobs:
         include:
           - os: windows-latest
             bundles: nsis
-          - os: macos-latest
+          # macos-latest 在免费共享池里常排队 15 分钟后被取消；固定 macos-14（arm64）
+          # 并交叉编译 x64，两个 job 用同一池，避免每次发版卡在调度。
+          - os: macos-14
             bundles: dmg
-          - os: macos-latest
+          - os: macos-14
             bundles: dmg
             rust_target: x86_64-apple-darwin
           - os: ubuntu-22.04
