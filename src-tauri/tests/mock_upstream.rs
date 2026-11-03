@@ -89,6 +89,7 @@ fn merge_adopts_campaign_meta_from_marketing() {
         priority: 10,
         grants: vec![],
         grant_items: vec![],
+        effective_at: None,
         campaign: None,
     }];
     let mut with_meta = base[0].clone();
@@ -184,6 +185,146 @@ fn marketing_payload_carries_campaign_meta() {
     assert_eq!(c.ends_at, Some(1793062800000));
 }
 
+/// 可领 payload 的 entitlements 若带 `effective_at`，必须单独抽出来（×1000 转 ms），
+/// 且**不能**回退到 starts_at —— 后者只是活动开始时间。
+#[test]
+fn marketing_plan_parses_entitlement_effective_at() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/marketing/touch",
+        vec![(
+            200,
+            r#"{"code":0,"data":{"deliveries":[{
+                "campaign_id":"camp-eff","resource_position":"banner",
+                "starts_at":1793012400,"ends_at":1793062800,
+                "banner":{
+                    "title":"ZCODE GLOBAL BUILD",
+                    "buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-eff"}}}],
+                    "args":{"zcode_plan":{"plan_id":"p-eff","name":"ZCODE GLOBAL BUILD","priority":9,
+                        "entitlements":[
+                            {"show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","grant_units":300000000,"period":"one_time","effective_at":1793026800},
+                            {"show_name":"GLM-5.3-Flash","meter":"model_usage","unit_type":"token","grant_units":100000000,"period":"one_time","effective_at":1793027600}
+                        ]}}
+                }}]}}"#,
+        )],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("meff");
+    let plans = claim::marketing_touch_plans(home.path(), &creds, None, None);
+    del_env("ZCODE_API_BASE");
+
+    let p = plans.iter().find(|p| p.plan_id == "p-eff").expect("应解析出 p-eff");
+    assert_eq!(p.effective_at, Some(1793026800000), "取 entitlements 最小 effective_at");
+    let c = p.campaign.as_ref().unwrap();
+    assert_eq!(
+        c.starts_at,
+        Some(1793012400000),
+        "starts_at 只代表活动开始，与生效时间无关"
+    );
+}
+
+/// 无 `effective_at` 时必须是 None，不得拿 starts_at 顶替。
+#[test]
+fn marketing_plan_without_effective_at_stays_none() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/marketing/touch",
+        vec![(
+            200,
+            r#"{"code":0,"data":{"deliveries":[{
+                "campaign_id":"camp-noeff","resource_position":"banner",
+                "starts_at":1793012400,"ends_at":1793062800,
+                "banner":{"title":"T","buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-noeff"}}}]}
+            }]}}"#,
+        )],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mnoeff");
+    let plans = claim::marketing_touch_plans(home.path(), &creds, None, None);
+    del_env("ZCODE_API_BASE");
+    let p = plans.iter().find(|p| p.plan_id == "p-noeff").expect("按钮兜底条目");
+    assert_eq!(p.effective_at, None, "缺失就是 None，不得用 starts_at 冒充");
+}
+
+/// 活动未上线时上游返回 404（zcode2api 2026-10-29 实测）：必须静默为空，
+/// 不能把「今天还没投放」渲染成「刷新失败」。
+#[test]
+fn preview_404_is_treated_as_empty() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/zcode-plan/billing/preview",
+        vec![(404, r#""#)],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("m404");
+    let plans = claim::preview_plans(home.path(), &creds, None, None).unwrap();
+    del_env("ZCODE_API_BASE");
+    assert!(plans.is_empty(), "404 必须按「暂无活动」处理");
+}
+
+/// 404 之外的失败仍要上抛，避免吞掉真实故障。
+#[test]
+fn preview_500_still_errors() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![Route::json(
+        "/api/v1/zcode-plan/billing/preview",
+        vec![(500, r#"{"msg":"boom"}"#)],
+    )]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("m500");
+    let err = claim::preview_plans(home.path(), &creds, None, None).unwrap_err();
+    del_env("ZCODE_API_BASE");
+    assert!(err.contains("500"), "got {err}");
+}
+
+/// 双通道兜底：preview 失败但 marketing 有活动 → 正常返回，诊断保留 preview 错误。
+#[test]
+fn preview_error_falls_back_to_marketing() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![
+        Route::json(
+            "/api/v1/zcode-plan/billing/preview",
+            vec![(500, r#"{"msg":"boom"}"#)],
+        ),
+        Route::json(
+            "/api/v1/marketing/touch",
+            vec![(
+                200,
+                r#"{"code":0,"data":{"deliveries":[{"campaign_id":"c-fb","resource_position":"banner","banner":{"title":"FB","buttons":[{"action":{"type":"claim_zcode_plan","args":{"plan_id":"p-fb"}}}]}}]}}"#,
+            )],
+        ),
+    ]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mfb");
+    let (plans, diag) =
+        claim::collect_claimable_plans_diag(home.path(), &creds, None, "mid-fb".into()).unwrap();
+    del_env("ZCODE_API_BASE");
+    assert!(plans.iter().any(|p| p.plan_id == "p-fb"), "marketing 必须兜底返回活动");
+    assert!(diag.preview_error.is_some(), "preview 错误要记录在诊断里");
+}
+
+/// 两通道都没货时仍要报错，不能把真实故障吞成「没有活动」。
+#[test]
+fn preview_error_without_marketing_still_errors() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mock = MockUpstream::start(vec![
+        Route::json(
+            "/api/v1/zcode-plan/billing/preview",
+            vec![(500, r#"{"msg":"boom"}"#)],
+        ),
+        Route::json(
+            "/api/v1/marketing/touch",
+            vec![(200, r#"{"code":0,"data":{"deliveries":[]}}"#)],
+        ),
+    ]);
+    set_env("ZCODE_API_BASE", &mock.base);
+    let (home, creds) = mock_account("mfb2");
+    let err = claim::collect_claimable_plans_diag(home.path(), &creds, None, "mid-x".into())
+        .unwrap_err();
+    del_env("ZCODE_API_BASE");
+    assert!(err.contains("500"), "got {err}");
+}
+
 #[test]
 fn preview_blocked_unusual_activity_3012_surfaces_error() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -228,12 +369,13 @@ fn merge_prefers_preview_and_sorts_by_priority() {
         priority: 10,
         grants: vec![],
         grant_items: vec![],
+        effective_at: None,
         campaign: None,
     }];
     let extra = vec![
-        claim::ClaimPlan { plan_id: "p1".into(), name: "dup".into(), description: String::new(), priority: 99, grants: vec![], grant_items: vec![], campaign: None },
-        claim::ClaimPlan { plan_id: "p2".into(), name: "P2".into(), description: String::new(), priority: 50, grants: vec![], grant_items: vec![], campaign: None },
-        claim::ClaimPlan { plan_id: "p3".into(), name: "P3".into(), description: String::new(), priority: 1, grants: vec![], grant_items: vec![], campaign: None },
+        claim::ClaimPlan { plan_id: "p1".into(), name: "dup".into(), description: String::new(), priority: 99, grants: vec![], grant_items: vec![], effective_at: None, campaign: None },
+        claim::ClaimPlan { plan_id: "p2".into(), name: "P2".into(), description: String::new(), priority: 50, grants: vec![], grant_items: vec![], effective_at: None, campaign: None },
+        claim::ClaimPlan { plan_id: "p3".into(), name: "P3".into(), description: String::new(), priority: 1, grants: vec![], grant_items: vec![], effective_at: None, campaign: None },
     ];
     let merged = claim::merge_marketing_plans(base, extra);
     let ids: Vec<&str> = merged.iter().map(|p| p.plan_id.as_str()).collect();
@@ -248,7 +390,7 @@ fn current_parses_active_plans() {
         vec![(200, r#"{"code":0,"data":{"plans":[
             {"user_plan_id":"u1","plan_id":"zcode-1024","name":"ZCode 1024 Dev Day","status":"active",
              "starts_at":100,"ends_at":200,
-             "entitlements":[{"entitlement_id":"e1","show_name":"GLM-5.3","meter":"model_usage","unit_type":"token","grant_units":200000000,"period":"one_time"}]}]}}"#)],
+             "entitlements":[{"entitlement_id":"e1","show_name":"GLM-5.3","meter":"model_usage","unit_type":"token","grant_units":200000000,"period":"one_time","effective_at":1793026800}]}]}}"#)],
     )]);
     set_env("ZCODE_API_BASE", &mock.base);
     let (home, creds) = mock_account("m5");
@@ -258,6 +400,11 @@ fn current_parses_active_plans() {
     assert_eq!(plans[0].status, "active");
     assert_eq!(plans[0].ends_at, Some(200000));
     assert_eq!(plans[0].grant_items[0].units, 200000000.0);
+    assert_eq!(
+        plans[0].effective_at,
+        Some(1793026800000),
+        "生效时间取 entitlements.effective_at，不是 starts_at"
+    );
 }
 
 #[test]

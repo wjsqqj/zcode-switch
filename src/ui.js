@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ic } from "./icons.js";
-import { t, has, errCode, stripErr, localeTag } from "./i18n.js";
+import { t, has, errCode, stripErr } from "./i18n.js";
+import { fmtDateTime, rangeOf, effectiveDetail } from "./claim-time.js";
 
 document.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -221,13 +222,29 @@ export function openActivityModal(m) {
     { k: "claimed", label: t("act.groupClaimed") },
     { k: "expired", label: t("act.groupExpired") },
   ];
-  const fmt = (ms) => (ms ? new Date(ms).toLocaleString(localeTag(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : t("act.notProvided"));
-  const fmtEffective = (ms) => (ms === 0 ? t("act.effectiveNow") : fmt(ms));
+  const fmt = (ms) => fmtDateTime(ms) || t("act.notProvided");
   const statusLabel = (s) => groups.find((g) => g.k === s)?.label || s;
+  const ACT_RANGE_KEYS = {
+    effective: "act.timeRange",
+    pending: "act.pendingRange",
+    estimated: "act.estimatedRange",
+    activity: "act.activityRange",
+  };
+  // 「生效」只认 effectiveAt：startsAt 是活动开始，只能落到 activity 文案
   const timeText = (r) => {
-    const startMs = r.effectiveAt ?? r.startsAt ?? null;
-    const pending = !!startMs && startMs > Date.now();
-    return t(pending ? "act.pendingRange" : "act.timeRange", { start: fmtEffective(startMs), end: fmt(r.endsAt) });
+    const g = rangeOf(r);
+    const key = ACT_RANGE_KEYS[g.kind];
+    if (!key) return "";
+    const start = g.startMs === 0 ? t("act.effectiveNow") : fmt(g.startMs);
+    return t(key, { start, end: g.endMs ? fmt(g.endMs) : t("act.notProvided") });
+  };
+  // 生效时间字段：字段值 / 预计+据活动说明 / 领取后确认
+  const effectiveText = (r) => {
+    const d = effectiveDetail(r);
+    if (d.kind === "immediate") return t("act.effectiveNow");
+    if (d.kind === "field") return fmt(d.at);
+    if (d.kind === "copy") return t("act.effectiveFromCopy", { time: fmt(d.at) });
+    return t("act.effectivePending");
   };
   const itemHtml = (r) => `
     <details class="act-item ${r.status}"${m?.focusAccount && r.accountId === m.focusAccount ? " open" : ""}>
@@ -240,7 +257,7 @@ export function openActivityModal(m) {
         <div class="act-kv"><b>${t("act.status")}</b><span>${esc(statusLabel(r.status))}</span></div>
         <div class="act-kv"><b>${t("act.account")}</b><span>${esc(r.accountName)}</span></div>
         <div class="act-kv"><b>${t("act.startsAt")}</b><span>${esc(fmt(r.startsAt))}</span></div>
-        <div class="act-kv"><b>${t("act.effectiveAt")}</b><span>${esc(fmtEffective(r.effectiveAt))}</span></div>
+        <div class="act-kv"><b>${t("act.effectiveAt")}</b><span>${esc(effectiveText(r))}</span></div>
         <div class="act-kv"><b>${t("act.endsAt")}</b><span>${esc(fmt(r.endsAt))}</span></div>
         <div class="act-kv"><b>${t("act.campaign")}</b><span>${esc(r.campaignId || t("act.notProvided"))}</span></div>
         <div class="act-kv"><b>${t("act.plan")}</b><span>${esc(r.planId)}</span></div>
@@ -252,13 +269,27 @@ export function openActivityModal(m) {
       </div>
     </details>`;
 
+  // 空态必须说明「为什么没有」：服务端未下发（无资格/已领取/版本被过滤）vs 本地无记录。
+  // 版本快照由 main.js 传入（version_status 命令），这里只负责展示。
+  const v = m?.version || null;
+  const diagHtml = `
+    <div class="act-empty act-diag">
+      <div class="act-diag-head">${esc(t("act.empty"))}</div>
+      ${v ? `<div class="act-diag-line">${esc(t("act.diagVersion", { reported: v.reported, latest: v.latest || t("act.notProvided") }))}</div>` : ""}
+      ${v?.stale ? `<div class="act-diag-line">${esc(t("act.diagStale"))}</div>` : ""}
+      ${v?.constantBehind ? `<div class="act-diag-line">${esc(t("act.diagBehind", { constant: v.clientConstant, latest: v.latest || t("act.notProvided") }))}</div>` : ""}
+      ${m?.diag?.previewEmpty && m?.diag?.marketingEmpty ? `<div class="act-diag-line">${esc(t("act.diagEmptyChannels"))}</div>` : ""}
+      ${m?.diag?.previewError ? `<div class="act-diag-line">${esc(t("act.diagPreviewError", { err: String(m.diag.previewError).slice(0, 120) }))}</div>` : ""}
+      <div class="act-diag-line">${esc(t("act.diagWindow"))}</div>
+      <div class="act-diag-line dim">${esc(t("act.diagClaimedElsewhere"))}</div>
+    </div>`;
   const body = groups
     .map((g) => {
       const list = rows.filter((r) => r.status === g.k);
       if (!list.length) return "";
       return `<div class="act-group"><div class="act-group-head">${esc(g.label)} (${list.length})</div>${list.map(itemHtml).join("")}</div>`;
     })
-    .join("") || `<div class="act-empty">${t("act.empty")}</div>`;
+    .join("") || diagHtml;
 
   const mask = document.createElement("div");
   mask.className = "act-mask";

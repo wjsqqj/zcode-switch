@@ -20,7 +20,9 @@ fn no_window(prog: &str) -> std::process::Command {
 pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
-pub const CLIENT_APP_VERSION: &str = "3.16.3";
+/// 最新已知的官方客户端版本（无 ZCode 安装 / 离线 / changelog 拉取失败时的兜底）。
+/// 2026-11-03 官方已发布 V3.17.2：活动按 `X-ZCode-App-Version` 下发，常量落后会导致被过滤。
+pub const CLIENT_APP_VERSION: &str = "3.17.2";
 
 pub(crate) fn client_platform() -> String {
     let os = crate::zcrypto::node_platform_for(std::env::consts::OS);
@@ -50,7 +52,10 @@ pub(crate) fn canonical_model_id(id: &str) -> String {
 
 const ZCODE_ORIGIN: &str = "https://zcode.z.ai";
 pub(crate) const ZCODE_LANG: &str = "zh-CN";
-const ZCODE_CHANNEL: &str = "stable";
+/// 官方客户端 bundle 里 `X-Release-Channel` 恒为 `production`；
+/// `stable` 是 3.11.2 时代的静态对齐值（已过时，属于指纹差异）。
+/// 回滚：改回 `stable` 即可——只影响请求指纹，不改变业务语义。
+const ZCODE_CHANNEL: &str = "production";
 
 pub(crate) fn device_mid() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -130,12 +135,61 @@ pub(crate) fn client_timezone() -> String {
 }
 
 pub(crate) fn zcode_app_version() -> String {
-    let detected = detected_app_version();
-    // changelog 缓存只读文件（后台线程负责保鲜），过期旧值仍参与 max——旧值也比常量新鲜
-    match crate::changelog::cached_latest(&crate::store::Paths::detect().home) {
-        Some(v) if version_ge(&v, &detected) => v,
-        _ => detected,
+    zcode_app_version_for(&crate::store::Paths::detect().home)
+}
+
+/// 指定 home 下的上报版本（测试与诊断用，避免依赖全局 Paths）。
+///
+/// 四层 max：本机探测 → 安装包内置快照 → changelog 缓存。
+/// 只靠「探测 + 常量」时，旧构建在「缓存从未成功拉取」的情况下会退回过期常量，
+/// 这正是活动被版本门槛过滤的唯一窗口；内置快照把这一层也堵上。
+pub(crate) fn zcode_app_version_for(home: &std::path::Path) -> String {
+    let mut v = detected_app_version();
+    for cand in [bundled_latest(), crate::changelog::cached_latest(home)]
+        .into_iter()
+        .flatten()
+    {
+        if version_ge(&cand, &v) {
+            v = cand;
+        }
     }
+    v
+}
+
+/// 安装包内置版本快照（打包时由 `scripts/dist.mjs` 写入，随安装包分发）。
+/// 换机 / 缓存被清 / 首次离线时，它比编译期常量更新，是第三层兜底。
+pub(crate) fn bundled_latest() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            bundled_latest_from(&dir)
+        })
+        .clone()
+}
+
+/// 从指定目录读快照：exe 同目录优先，其次 `resources/` 子目录（NSIS 安装形态）。
+/// 坏 JSON / 无权限一律 None，绝不 panic。
+fn bundled_latest_from(dir: &std::path::Path) -> Option<String> {
+    for p in [
+        dir.join("known-latest.json"),
+        dir.join("resources").join("known-latest.json"),
+    ] {
+        let Ok(raw) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(ver) = v.get("version").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let ver = ver.trim();
+        if !ver.is_empty() {
+            return Some(ver.to_string());
+        }
+    }
+    None
 }
 
 fn detected_app_version() -> String {
@@ -172,9 +226,45 @@ fn detected_app_version() -> String {
                     return pick_app_version(&ver);
                 }
             }
-            CLIENT_APP_VERSION.to_string()
+            // 注册表查不到（绿色版/自定义安装路径）→ 读 settings 配置的 ZCode.exe 文件版本
+            version_from_zcode_path()
+                .map(|v| normalize_version(&v))
+                .unwrap_or_else(|| CLIENT_APP_VERSION.to_string())
         })
         .clone()
+}
+
+/// 版本三级回退的第二级：从 `settings.zcode_path` 指向的 ZCode.exe 读 ProductVersion。
+/// 只在本进程首次解析版本时执行一次（`detected_app_version` 有 OnceLock）。
+#[cfg(windows)]
+fn version_from_zcode_path() -> Option<String> {
+    let paths = crate::store::Paths::detect();
+    let (exe, ok) = crate::store::effective_zcode_path(&paths);
+    if !ok || exe.trim().is_empty() {
+        return None;
+    }
+    let out = no_window("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-Item -LiteralPath '{}').VersionInfo.ProductVersion",
+                exe.replace('\'', "''")
+            ),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+#[cfg(not(windows))]
+fn version_from_zcode_path() -> Option<String> {
+    None
 }
 
 fn is_zcode_display_name(name: &str) -> bool {
@@ -182,7 +272,7 @@ fn is_zcode_display_name(name: &str) -> bool {
     l.contains("zcode") && !l.contains("switch")
 }
 
-fn version_ge(a: &str, b: &str) -> bool {
+pub(crate) fn version_ge(a: &str, b: &str) -> bool {
     let parse = |v: &str| -> Vec<u64> {
         v.split('.')
             .map(|p| p.trim().parse().unwrap_or(0))
@@ -1510,9 +1600,317 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
     }
 }
 
+// ── zcode.z.ai 弹性 HTTP 层（2026-11-03，移植 PR#43）──────────────────────────
+//
+// 背景：zcode.z.ai 前置阿里云 ESA WAF，会不定期调整对进程内 TLS 栈的指纹策略，
+// 表现为 2xx 但 body 为空 / 连接超时。策略是「curl(Schannel) 优先，ureq(native-tls) 兜底」，
+// 任一通道传输层不可信时换另一条；4xx/5xx 属于有语义的响应，直接交给调用方判定。
+
+#[derive(Debug)]
+pub(crate) struct HttpResp {
+    pub status: u16,
+    pub body: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpResp {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let want = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == want)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+pub(crate) fn native_tls_connector() -> std::sync::Arc<native_tls::TlsConnector> {
+    static C: std::sync::OnceLock<std::sync::Arc<native_tls::TlsConnector>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Arc::new(native_tls::TlsConnector::new().expect("native-tls init")))
+        .clone()
+}
+
+fn curl_binary() -> &'static str {
+    if cfg!(windows) {
+        r"C:\Windows\System32\curl.exe"
+    } else {
+        "curl"
+    }
+}
+
+fn curl_escape(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+/// curl 的 `-K -` 配置里，最后一行是 `%{http_code}`；前面是 body。
+fn split_curl_output(raw: &str) -> Result<(String, u16), String> {
+    let trimmed = raw.trim_end_matches(['\r', '\n']);
+    let idx = trimmed.rfind('\n').ok_or_else(|| "curl: missing status line".to_string())?;
+    let (body, code) = trimmed.split_at(idx);
+    let status = code
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "curl: bad status".to_string())?;
+    Ok((body.trim_start_matches(['\r', '\n']).to_string(), status))
+}
+
+/// dump-header 可能包含 100-continue / 重定向的多段头，取最后一段。
+fn parse_header_dump(raw: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if line.to_ascii_uppercase().starts_with("HTTP/") {
+            out.clear();
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            out.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// 经系统 curl（Windows=Schannel）发请求。凭据全部走 stdin，不出现在命令行参数里。
+pub(crate) fn curl_http(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<HttpResp, String> {
+    let exe = curl_binary();
+    if cfg!(windows) && !std::path::Path::new(exe).exists() {
+        return Err("curl.exe not found".into());
+    }
+    let hdr_path = std::env::temp_dir().join(format!("zsw-hdr-{}.txt", uuid::Uuid::new_v4().simple()));
+    let mut cfg = String::new();
+    cfg.push_str(&format!("url = \"{}\"\n", curl_escape(url)));
+    cfg.push_str(&format!("request = \"{}\"\n", curl_escape(method)));
+    cfg.push_str("silent\nshow-error\n");
+    cfg.push_str("connect-timeout = \"10\"\n");
+    cfg.push_str(&format!("max-time = \"{timeout_secs}\"\n"));
+    cfg.push_str("write-out = \"\\n%{http_code}\"\n");
+    cfg.push_str(&format!(
+        "dump-header = \"{}\"\n",
+        curl_escape(&hdr_path.to_string_lossy())
+    ));
+    for (k, v) in headers {
+        cfg.push_str(&format!("header = \"{}: {}\"\n", curl_escape(k), curl_escape(v)));
+    }
+    if let Some(b) = body {
+        cfg.push_str(&format!("data-raw = \"{}\"\n", curl_escape(b)));
+    }
+
+    let mut child = no_window(exe)
+        .arg("-K")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+    {
+        use std::io::Write as _;
+        if let Some(mut si) = child.stdin.take() {
+            si.write_all(cfg.as_bytes()).map_err(|e| format!("curl stdin: {e}"))?;
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("curl wait: {e}"))?;
+    let raw_headers = std::fs::read_to_string(&hdr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&hdr_path);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("curl exit {:?}: {err}", out.status.code()));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, status) = split_curl_output(&raw)?;
+    Ok(HttpResp {
+        status,
+        body,
+        headers: parse_header_dump(&raw_headers),
+    })
+}
+
+/// ureq 兜底通道：显式挂 native-tls（Windows=Schannel）。4xx/5xx 也按 Ok 返回。
+pub(crate) fn ureq_http(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<HttpResp, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_secs))
+        .tls_connector(native_tls_connector())
+        .build();
+    let mut req = if method.eq_ignore_ascii_case("POST") {
+        agent.post(url)
+    } else {
+        agent.get(url)
+    };
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let result = match body {
+        Some(b) => req.send_string(b),
+        None => req.call(),
+    };
+    let collect = |r: ureq::Response| {
+        let status = r.status();
+        let headers: Vec<(String, String)> = r
+            .headers_names()
+            .iter()
+            .filter_map(|h| r.header(h).map(|v| (h.clone(), v.to_string())))
+            .collect();
+        let body = r.into_string().unwrap_or_default();
+        HttpResp { status, body, headers }
+    };
+    match result {
+        Ok(r) => Ok(collect(r)),
+        Err(ureq::Error::Status(code, r)) => {
+            let mut resp = collect(r);
+            resp.status = code;
+            Ok(resp)
+        }
+        Err(e) => Err(format!("ureq: {e}")),
+    }
+}
+
+/// 弹性请求：curl 优先，传输层不可信时回退 ureq；两通道都不行才报错。
+pub(crate) fn zcode_http(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<HttpResp, String> {
+    let curl_err: String = match curl_http(url, method, headers, body, timeout_secs) {
+        Ok(r) => {
+            // 4xx/5xx 是有语义的响应（404=未投放、401/403=挑战），直接用
+            if r.status >= 400 || !r.body.trim().is_empty() {
+                return Ok(r);
+            }
+            format!("curl empty body (HTTP {})", r.status)
+        }
+        Err(e) => e,
+    };
+    match ureq_http(url, method, headers, body, timeout_secs) {
+        Ok(r) if !r.body.trim().is_empty() => Ok(r),
+        Ok(r) => Err(format!("empty response (HTTP {}); curl: {curl_err}", r.status)),
+        Err(e) => Err(format!("curl: {curl_err}; ureq: {e}")),
+    }
+}
+
+/// 统一的「HTTP 状态码 + body 片段」错误文案（供 claim 侧复用）。
+pub(crate) fn http_status_error(prefix: &str, resp: &HttpResp) -> String {
+    let snippet: String = resp.body.chars().take(160).collect();
+    format!("{prefix} HTTP {}: {}", resp.status, snippet.trim())
+}
+
+/// 本次请求实际使用的通道（诊断用）。
+pub(crate) fn zcode_http_json(resp: &HttpResp) -> Result<Value, String> {
+    let body = resp.body.trim_start_matches('\u{feff}').trim();
+    serde_json::from_str::<Value>(body).map_err(|e| {
+        format!(
+            "non-json response (HTTP {}): {e}: {}",
+            resp.status,
+            body.chars().take(120).collect::<String>()
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// 起一个极简 HTTP mock（最多服务 5 次），返回 `http://127.0.0.1:port/`。
+    pub(crate) fn spawn_http_mock(response: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..5 {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/")
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    /// curl 通道能直连本地 mock（http 不需要 TLS），且能解析状态码/body/头。
+    #[test]
+    fn curl_http_reads_local_mock() {
+        let mock = super::tests_support::spawn_http_mock(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Test: yes\r\nContent-Length: 10\r\n\r\n{\"code\":0}",
+        );
+        if cfg!(windows) && !std::path::Path::new(curl_binary()).exists() {
+            return;
+        }
+        let r = curl_http(&mock, "GET", &[], None, 10).expect("curl should work");
+        assert_eq!(r.status, 200);
+        assert!(r.body.contains("\"code\":0"));
+        assert_eq!(r.header("x-test"), Some("yes"));
+    }
+
+    /// 2xx 但 body 为空 → 两通道都视为失败。
+    #[test]
+    fn zcode_http_rejects_empty_body() {
+        let mock = super::tests_support::spawn_http_mock("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let err = zcode_http(&mock, "GET", &[], None, 10).unwrap_err();
+        assert!(err.contains("empty"), "got {err}");
+    }
+
+    /// 404 属有语义响应，必须原样返回给上层（preview 静默依赖它）。
+    #[test]
+    fn zcode_http_returns_404_as_response() {
+        let mock = super::tests_support::spawn_http_mock("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let r = zcode_http(&mock, "GET", &[], None, 10).expect("404 应返回响应而非错误");
+        assert_eq!(r.status, 404);
+    }
+}
+
 #[cfg(test)]
 mod version_tests {
-    use super::version_ge;
+    use super::{bundled_latest_from, version_ge};
+
+    /// 安装包快照：exe 同目录优先，其次 resources/；坏 JSON 必须返回 None（不得 panic）。
+    #[test]
+    fn bundled_snapshot_reads_dirs_and_tolerates_bad_json() {
+        let dir = std::env::temp_dir().join(format!("zsw-bundled-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("resources")).unwrap();
+
+        std::fs::write(dir.join("known-latest.json"), r#"{"version":"3.17.2"}"#).unwrap();
+        assert_eq!(bundled_latest_from(&dir).as_deref(), Some("3.17.2"));
+
+        std::fs::remove_file(dir.join("known-latest.json")).unwrap();
+        std::fs::write(dir.join("resources/known-latest.json"), r#"{"version":" 3.18.0 "}"#).unwrap();
+        assert_eq!(bundled_latest_from(&dir).as_deref(), Some("3.18.0"), "要 trim");
+
+        std::fs::write(dir.join("resources/known-latest.json"), "not json").unwrap();
+        assert_eq!(bundled_latest_from(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn version_ge_semantics() {

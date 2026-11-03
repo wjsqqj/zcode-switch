@@ -1,6 +1,6 @@
 [package]
 name = "zcode-switch"
-version = "1.7.3-Z.EMAIL"
+version = "1.7.4-Z.EMAIL"
 description = "ZCode 账号切换器"
 license = "MIT"
 edition = "2021"
@@ -26,7 +26,10 @@ chrono = "0.4"
 aes-gcm = "0.10"
 base64 = "0.22"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-ureq = { version = "2", features = ["json"] }
+# native-tls 在 Windows 上走 Schannel，指纹与系统客户端一致（ureq 需显式在 AgentBuilder 上挂 connector）。
+# 参考 PR#43：zcode.z.ai 前置 WAF 会因 TLS 指纹静默降级，双通道（curl + native-tls）互为兜底。
+ureq = { version = "2", features = ["json", "native-tls"] }
+native-tls = "0.2"
 sys-locale = "0.3"
 
 [target.'cfg(windows)'.dependencies]
