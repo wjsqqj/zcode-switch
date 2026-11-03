@@ -1,5 +1,20 @@
 # 更新日志
 
+## v1.7.5-Z.EMAIL（2026-11-03）
+
+### 新增：macOS 原生 Liquid Glass 界面（感谢 [@245678000000](https://github.com/245678000000)）
+
+- **玻璃侧栏**：主窗改为侧栏布局，侧栏由 `NSGlassEffectView` / `NSVisualEffectView` 挂在 WKWebView 下方，取样桌面与后方窗口；WebView 内对应区域镂空，不做二次绘制。
+- **工具栏胶囊**：刷新 / 活动按钮收进浮动胶囊（取样窗口底色）；标题栏与胶囊区域支持拖动窗口。
+- **设置窗外框**：设置窗口同样改为透明 + Overlay 标题栏，外观跟随系统深浅色切换。
+- **平台隔离**：原生调用由 `#[cfg(target_os = "macos")]` 与前端 `IS_MAC` 双重保护，Windows / Linux 保持原有布局与主题；`src/mac.css` 全部选择器限定在 `html.mac` 下。
+
+### 其他
+
+- 修复非 macOS 目标下玻璃帧结构体的 `dead_code` 告警，`cargo check` 恢复零告警。
+
+---
+
 ## v1.7.4-Z.EMAIL（2026-11-03）
 
 ### 修复：生效时间显示错误、已领取信息缺失、活动刷不出来

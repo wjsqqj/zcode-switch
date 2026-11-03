@@ -57,19 +57,26 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Z·SWITCH ${{ github.ref_name }}'
           releaseBody: |
-            ## 本次更新（v1.7.4-Z.EMAIL）
+            ## 本次更新（v1.7.5-Z.EMAIL）
 
-            ### 修复：生效时间显示错误、已领取信息缺失、活动刷不出来
+            ### 新增：macOS 原生 Liquid Glass 界面（感谢 @245678000000）
 
-            - **生效时间不再用活动开始时间冒充**：`starts_at`（活动开始）与 `entitlements[].effective_at`（权益生效）彻底分开，可领 / 已领取 / 详情统一按「字段 → 活动文案兜底 → 领取后确认」取值；文案兜底标注「预计 … 生效（据活动说明）」，时间统一为 `YYYY-MM-DD HH:mm`
-            - **已领取也能看到时间区间**：领取历史落盘 `startsAt / endsAt / effectiveAt`，行内条与详情显示「已领取过 X · 生效 … → 至 …」，老记录显示「时间未记录」
-            - **退出重登后已领取记录不再丢**：历史按 `userId`（JWT sub）兜底匹配，重登换了 accountId 也能命中
-            - **领取后活动从列表消失**：`billing/current` 在权益生效前返回空，改用 `billing/balance` 的 `Start Plan` 套餐名推断「已领取」，面板补一条并标「已领取（待生效）」
-            - **刷不出来时看得懂原因**：新增版本诊断（上报版本 / 官方最新 / 缓存是否过期 / 内置常量是否落后），活动面板空态直接给出原因与「官方客户端领取无法同步」说明；`--cli claim-raw` 增加 `_meta`（版本、token 来源、device mid 掩码，不含令牌）
-            - **preview 404 / 报错不再整单失败**：404 视为「今日未投放」静默为空；preview 报错时用 `marketing/touch` 结果兜底展示，两通道都空才报错
-            - **弹性 HTTP 层（移植 PR #43）**：`zcode.z.ai` 请求改为「系统 curl(Schannel) 优先 + ureq(native-tls) 兜底」，2xx 空 body / 非 JSON 视为传输失败自动换通道；凭据只经 stdin 传递，不出现在命令行
-            - **版本保鲜三兜底**：`CLIENT_APP_VERSION` 升到 3.17.2、changelog 缓存 TTL 收紧到 6h；启动与首次刷新活动时若缓存缺失会同步拉取（3s / 2s 硬超时）；新增安装包内置 `known-latest.json` 快照（打包时自动刷新），换机 / 缓存被清 / 首次离线不再退回过期版本号
-            - 活动面板空态补充「活动通常每天 19:00（北京时间）后放量」说明
+            - **玻璃侧栏**：主窗改为侧栏布局，侧栏由 `NSGlassEffectView` / `NSVisualEffectView` 挂在 WKWebView 下方，取样桌面与后方窗口；WebView 内对应区域镂空，不做二次绘制
+            - **工具栏胶囊**：刷新 / 活动按钮收进浮动胶囊（取样窗口底色）；标题栏与胶囊区域支持拖动窗口
+            - **设置窗外框**：设置窗口同样改为透明 + Overlay 标题栏，外观跟随系统深浅色切换
+            - **平台隔离**：原生调用由 `#[cfg(target_os = "macos")]` 与前端 `IS_MAC` 双重保护，Windows / Linux 保持原有布局与主题；`src/mac.css` 全部选择器限定在 `html.mac` 下
+
+            ### 其他
+
+            - 修复非 macOS 目标下玻璃帧结构体的 `dead_code` 告警，`cargo check` 恢复零告警
+
+            ### 上一版（v1.7.4）主要内容
+
+            - 生效时间只认 `entitlements.effective_at`，不再用活动开始时间冒充；文案兜底标注来源并统一带年份
+            - 领取历史落盘时间并按 `userId` 匹配，退出重登不丢已领取记录；`billing/current` 为空时用 `billing/balance` 的 Start Plan 推断「已领取」
+            - preview 404 静默为「今日未投放」、preview 失败降级到 `marketing/touch`；活动面板空态给出渠道 / 版本 / 投放窗口诊断
+            - `zcode.z.ai` 请求改为 curl(Schannel) 优先 + ureq(native-tls) 兜底，2xx 空 body 视为传输失败自动换通道
+            - 版本保鲜三兜底：常量 3.17.2、changelog TTL 6h、启动与首次刷新缺失同步、安装包内置 `known-latest.json` 快照
 
             ## 关于本项目
 
