@@ -138,6 +138,12 @@ jobs:
         run: |
           TGT="${{ matrix.rust_target }}"
           [ -n "$TGT" ] || TGT="native"
-          find src-tauri/target -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) \
-            | xargs sha256sum | sed 's| .*/| |' > "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt"
+          # macOS 预装的是 shasum，没有 GNU sha256sum（否则 xargs 直接 No such file）
+          if command -v sha256sum >/dev/null 2>&1; then
+            HASH=(sha256sum)
+          else
+            HASH=(shasum -a 256)
+          fi
+          find src-tauri/target -type f \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' \) -print0 \
+            | xargs -0 "${HASH[@]}" | sed 's| .*/| |' > "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt"
           gh release upload "$GITHUB_REF_NAME" "checksums-${RUNNER_OS}-${TGT}-${GITHUB_REF_NAME}.txt" --clobber
