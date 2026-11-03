@@ -1611,6 +1611,8 @@ pub(crate) struct HttpResp {
     pub status: u16,
     pub body: String,
     pub headers: Vec<(String, String)>,
+    /// 实际使用的通道：`curl` 或 `ureq`（诊断日志要能看出是否降级）
+    pub transport: &'static str,
 }
 
 impl HttpResp {
@@ -1739,6 +1741,7 @@ pub(crate) fn curl_http(
         status,
         body,
         headers: parse_header_dump(&raw_headers),
+        transport: "curl",
     })
 }
 
@@ -1775,7 +1778,12 @@ pub(crate) fn ureq_http(
             .filter_map(|h| r.header(h).map(|v| (h.clone(), v.to_string())))
             .collect();
         let body = r.into_string().unwrap_or_default();
-        HttpResp { status, body, headers }
+        HttpResp {
+            status,
+            body,
+            headers,
+            transport: "ureq",
+        }
     };
     match result {
         Ok(r) => Ok(collect(r)),

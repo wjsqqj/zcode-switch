@@ -255,6 +255,48 @@ pub struct VersionStatus {
 - **禁止扩散**：404 静默只允许存在于 preview 读路径；`submit_claim` 的任何失败必须报错。
 - **渠道值**：`X-Release-Channel = production`（官方 bundle 实测）；`stable` 是 3.11.2 时代遗留值。
 
+### 10.5 诊断日志与导出（2026-11-04 补充，任务 activity-diagnostics-export）
+
+**为什么**：用户反馈「别人刷不出活动、我这边能刷出」。若只有失败日志，两端无法对比；必须把**成功路径**也落成可对比的结构化行。
+
+**日志格式**（`flowlog`，`[claim]` 流）
+
+```
+2026-11-04 00:15:41 [claim] refresh acct=4b4d0629… ver=3.17.2 token=zcodejwt preview=200/0/0 marketing=200/0/1 transport=curl ms=1888 plans=1
+2026-11-04 00:15:41 [claim] probe   acct=4b4d0629… plans=1 status=200 code=0 transport=curl
+```
+
+- 字段含义：`预览/活动 = HTTP状态/业务码/条数`；`token` = `zcodejwt|oauth|none`；`transport` = `curl|ureq`。
+- 采集点：`claim_refresh`（GUI/CLI 刷新）、`activity_probe`（探测）、`--cli claim-preview`。
+- **只写数字与枚举**，不写 URL、文案、令牌。
+
+**导出**
+
+```rust
+pub fn diag::build_text(paths: &Paths, account: Option<&str>) -> String;
+// Tauri: diagnostics_json(account) / export_diagnostics(app, account) → 保存对话框
+// CLI:   --cli diag [--id <id>]  → 直接打印
+```
+
+内容：`{schema, notice, generatedAt, app{version,os,arch,language}, version{...}, accounts[{id(masked),name,history}], recentRefresh[], flowlogTail[], truncated}`；总量 >512KB 时清空 `flowlogTail` 并置 `truncated:true`。
+
+**脱敏（双保险）**
+
+1. 采集阶段：id 只写前 8 位，`deviceMid` 从不进入日志；
+2. 导出阶段 `mask_secrets()`：`Bearer <token>` → `Bearer ***`，≥32 位 hex/uuid → 前 8 位 + `…`。
+
+**测试**：`diag::tests::mask_hides_tokens_and_long_ids`、`mask_keeps_normal_text`。
+
+**Wrong / Correct**
+
+```rust
+// Wrong：把令牌/完整 id 写进日志
+flowlog::log("claim", "refresh", &format!("token={token} mid={mid} acct={id}"));
+
+// Correct：只写枚举 + 掩码 + 数字
+flowlog::log("claim", "refresh", &diag::refresh_line(&id, &ver, token_source, &diag, plans.len()));
+```
+
 ## 11. 版本链与测试旁路（2026-10-24 补充，任务 changelog-version / mock-upstream-tests）
 
 - 上报版本 = `max(注册表探测, 安装包内置快照, changelog 缓存最新, CLIENT_APP_VERSION 常量)`（四层，2026-11-03 增快照）。

@@ -55,6 +55,8 @@ pub fn run(args: &[String]) -> (String, i32) {
         out
     };
     let paths = Paths::detect();
+    // 让 `--cli diag` / `claim-preview` 能读写与 GUI 相同的日志文件
+    crate::flowlog::init_default();
 
     if let Some(l) = lang_override {
         crate::i18n::set(l);
@@ -176,17 +178,30 @@ pub fn run(args: &[String]) -> (String, i32) {
             let mut items = vec![];
             for acc in accounts.iter().filter(|a| only.as_deref().map_or(true, |id| id == a.id)) {
                 let res = ensure_virtual_device_mid(&paths, &acc.id).and_then(|mid| {
-                    crate::claim::collect_claimable_plans(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
+                    crate::claim::collect_claimable_plans_diag(&paths.home, &acc.credentials, acc.config.as_ref(), mid)
                 });
                 match res {
-                    Ok(plans) => {
+                    Ok((plans, diag)) => {
                         if !plans.is_empty() {
                             any = true;
                         }
+                        // 与 GUI 刷新同源的一行摘要，便于两端日志对比
+                        let version = crate::changelog::version_status(&paths.home);
+                        let token = crate::claim::token_source(
+                            &acc.credentials,
+                            acc.config.as_ref(),
+                            &crate::zcrypto::default_secret(&paths.home),
+                        );
+                        crate::flowlog::log(
+                            "claim",
+                            "refresh",
+                            &crate::diag::refresh_line(&acc.id, &version.reported, token, &diag, plans.len()),
+                        );
                         items.push(json!({
                             "id": acc.id,
                             "name": acc.name,
                             "plans": plans,
+                            "diag": diag,
                         }));
                     }
                     Err(e) => items.push(json!({
@@ -310,6 +325,11 @@ pub fn run(args: &[String]) -> (String, i32) {
                 })),
                 Err(e) => return (err(&e), 1),
             }
+        }
+        // 诊断导出：打印脱敏 JSON（版本 / 通道状态 / 刷新摘要），用户可直接复制发送。
+        "diag" => {
+            let id = flag(rest, "--id");
+            crate::diag::build_text(&paths, id.as_deref())
         }
         "behavior" => {
             let las = flag(rest, "--launch-after-switch");

@@ -67,6 +67,15 @@ const actions = {
     });
   },
 
+  /// 导出脱敏诊断日志：对方把 JSON 发过来即可排查「为什么他刷不出活动」
+  async exportDiag() {
+    await guard(async () => {
+      const r = await invoke("export_diagnostics", {});
+      if (!r?.picked) return;
+      toast(t("m.diagExported", { path: r.path }), "ok");
+    });
+  },
+
   async exportAll() {
     await guard(async () => {
       const p = await invoke("export_all_pick_path");
@@ -198,6 +207,7 @@ function render() {
       <div class="lib-row">
         <button class="btn-ghost has-ic" click="actions.importFiles()">${ic("import", 14)} ${t("s.importBtn")}</button>
         <button class="btn-ghost has-ic" click="actions.exportAll()" ${s.accounts.length ? "" : "disabled"}>${ic("exportAll", 14)} ${t("s.exportAllBtn")}</button>
+        <button class="btn-ghost has-ic" click="actions.exportDiag()">${ic("export", 14)} ${t("s.diagExport")}</button>
       </div>
       <label style="margin-top:14px">${t("s.pathLabel")}</label>
       <div class="path-line">

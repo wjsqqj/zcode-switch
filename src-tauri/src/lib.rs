@@ -3,6 +3,7 @@ pub mod cli;
 pub mod i18n;
 pub mod changelog;
 pub mod claim;
+mod diag;
 mod flowlog;
 mod glass;
 mod oauth;
@@ -320,6 +321,41 @@ async fn version_status() -> Result<changelog::VersionStatus, String> {
     .await
 }
 
+/// 诊断 JSON（脱敏）：CLI 与前端共用，不落盘、不发起上游请求。
+#[tauri::command]
+async fn diagnostics_json(account: Option<String>) -> Result<String, String> {
+    run_blocking(move || Ok(diag::build_text(&Paths::detect(), account.as_deref()))).await
+}
+
+/// 导出诊断 JSON：弹保存框让用户选路径（对方把文件发过来即可排查）。
+#[tauri::command]
+async fn export_diagnostics(app: AppHandle, account: Option<String>) -> Result<serde_json::Value, String> {
+    let text = diag::build_text(&Paths::detect(), account.as_deref());
+    let name = format!(
+        "zswitch-diag-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter(&i18n::tr("dialog.diag"), &["json"])
+        .set_file_name(&name)
+        .blocking_save_file();
+    let Some(fp) = picked else {
+        return Ok(json!({ "picked": false }));
+    };
+    let path = fp
+        .into_path()
+        .map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
+    std::fs::write(&path, text.as_bytes()).map_err(|e| {
+        i18n::trf(
+            "err.write_file",
+            &[("path", &path.display().to_string()), ("e", &e.to_string())],
+        )
+    })?;
+    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "bytes": text.len() }))
+}
+
 #[tauri::command]
 async fn claim_current(id: String) -> Result<ClaimCurrentResult, String> {
     run_blocking(move || {
@@ -389,12 +425,25 @@ async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshRe
             risk::observe_upstream_failure(&paths, &id, &e);
             e
         })?;
+        let version = changelog::version_status(&paths.home);
+        let token_src = claim::token_source(
+            &acc.credentials,
+            acc.config.as_ref(),
+            &zcrypto::default_secret(&paths.home),
+        );
+        let plan_count = plans.len();
+        // 结构化刷新摘要：版本 / token 来源 / 两通道状态码与条数 / 通道 / 耗时
+        flowlog::log(
+            "claim",
+            "refresh",
+            &diag::refresh_line(&id, &version.reported, token_src, &diag, plan_count),
+        );
         Ok(ClaimRefreshResult {
             plans,
             activated,
             activation_error,
             diag,
-            version: changelog::version_status(&paths.home),
+            version,
         })
     })
     .await
@@ -589,11 +638,23 @@ async fn activity_probe(ids: Vec<String>) -> Result<ActivityProbeResult, String>
                 skipped.push(id);
                 continue;
             };
-            let plans = claim::probe_marketing_only(
+            let (plans, meta) = claim::marketing_touch_plans_meta(
                 &paths.home,
                 &acc.credentials,
                 acc.config.as_ref(),
                 Some(mid),
+            );
+            flowlog::log(
+                "claim",
+                "probe",
+                &format!(
+                    "acct={} plans={} status={} code={} transport={}",
+                    diag::mask_id(&id),
+                    plans.len(),
+                    meta.status,
+                    meta.code,
+                    meta.transport
+                ),
             );
             items.push(ActivityProbeItem { account_id: id, name: acc.name, plans });
         }
@@ -1761,6 +1822,8 @@ pub fn run() {
             claim_refresh,
             claim_current,
             version_status,
+            diagnostics_json,
+            export_diagnostics,
             claim_start,
             claim_captcha_config,
             claim_captcha_submit,

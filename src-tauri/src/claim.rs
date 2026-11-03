@@ -304,6 +304,16 @@ pub fn preview_plans(
     config: Option<&Value>,
     device_mid: Option<String>,
 ) -> Result<Vec<ClaimPlan>, String> {
+    preview_plans_meta(home, creds, config, device_mid).map(|(plans, _)| plans)
+}
+
+/// 同 `preview_plans`，额外返回 HTTP 明细（状态码 / 业务码 / 条数 / 通道）供诊断日志使用。
+pub fn preview_plans_meta(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> Result<(Vec<ClaimPlan>, HttpMeta), String> {
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
     let url = format!(
@@ -312,13 +322,21 @@ pub fn preview_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
-    preview_once(&url, &token, device_mid)
+    let mut meta = HttpMeta::default();
+    let plans = preview_once(&url, &token, device_mid, &mut meta)?;
+    Ok((plans, meta))
 }
 
-fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<ClaimPlan>, String> {
+fn preview_once(
+    url: &str,
+    token: &str,
+    mid: Option<String>,
+    meta_out: &mut HttpMeta,
+) -> Result<Vec<ClaimPlan>, String> {
     let headers = quota::zai_billing_headers_with_mid(token, mid);
     let resp = quota::zcode_http(url, "GET", &headers, None, CLAIM_TIMEOUT_SECS)
         .map_err(|e| crate::i18n::trf("err.claim.preview_req", &[("e", &e)]))?;
+    *meta_out = HttpMeta::of(&resp);
     // 活动未上线时上游返回 404（zcode2api 2026-10-29 官方客户端 mitm 实测）：
     // 属正常态，静默为空——否则「今天还没投放」会被渲染成「刷新失败」。
     if resp.status == 404 {
@@ -329,6 +347,7 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
     }
     let v: Value = quota::zcode_http_json(&resp)?;
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    meta_out.code = code;
     if code != 0 {
         return Err(failure_message(code, &v));
     }
@@ -339,6 +358,7 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
         .unwrap_or_default();
     let mut out: Vec<ClaimPlan> = plans.iter().filter_map(parse_plan).collect();
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    meta_out.count = out.len();
     Ok(out)
 }
 
@@ -424,14 +444,25 @@ pub fn marketing_touch_plans(
     config: Option<&Value>,
     device_mid: Option<String>,
 ) -> Vec<ClaimPlan> {
-    let fail = |detail: &str| -> Vec<ClaimPlan> {
+    marketing_touch_plans_meta(home, creds, config, device_mid).0
+}
+
+/// 同 `marketing_touch_plans`，额外返回通道明细（状态码 / 业务码 / 条数 / 通道）供诊断日志使用。
+pub fn marketing_touch_plans_meta(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+) -> (Vec<ClaimPlan>, HttpMeta) {
+    let mut meta = HttpMeta::default();
+    let fail = |m: &HttpMeta, detail: &str| -> (Vec<ClaimPlan>, HttpMeta) {
         flowlog::log("claim", "marketing-fail", detail);
-        Vec::new()
+        (Vec::new(), m.clone())
     };
     let secret = zcrypto::default_secret(home);
     let token = match claim_token(creds, config, &secret) {
         Ok(t) => t,
-        Err(e) => return fail(&e),
+        Err(e) => return fail(&meta, &e),
     };
     let headers = quota::zai_billing_headers_with_mid(&token, device_mid);
     let resp = match quota::zcode_http(
@@ -442,17 +473,20 @@ pub fn marketing_touch_plans(
         CLAIM_TIMEOUT_SECS,
     ) {
         Ok(r) => r,
-        Err(e) => return fail(&format!("marketing: {e}")),
+        Err(e) => return fail(&meta, &format!("marketing: {e}")),
     };
+    meta = HttpMeta::of(&resp);
     if !resp.ok() {
-        return fail(&quota::http_status_error("marketing", &resp));
+        return fail(&meta, &quota::http_status_error("marketing", &resp));
     }
     let v: Value = match quota::zcode_http_json(&resp) {
         Ok(v) => v,
-        Err(e) => return fail(&e),
+        Err(e) => return fail(&meta, &e),
     };
-    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
-        return fail(&format!("code {}", v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1)));
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    meta.code = code;
+    if code != 0 {
+        return fail(&meta, &format!("code {code}"));
     }
     let mut payloads: Vec<ClaimPlan> = Vec::new();
     let mut button_ids: Vec<String> = Vec::new();
@@ -492,7 +526,8 @@ pub fn marketing_touch_plans(
     let mut out: Vec<ClaimPlan> = payloads;
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
     out.dedup_by(|a, b| a.plan_id == b.plan_id);
-    out
+    meta.count = out.len();
+    (out, meta)
 }
 
 fn collect_strings(v: &Value, keys: &[&str], out: &mut Vec<String>) {
@@ -782,6 +817,33 @@ pub struct ClaimDiag {
     pub marketing_empty: bool,
     /// preview 通道本身的错误（marketing 兜底成功时仍然记录，供 UI 解释降级）
     pub preview_error: Option<String>,
+    /// preview 通道的 HTTP 明细（诊断日志用）
+    pub preview: Option<HttpMeta>,
+    /// marketing 通道的 HTTP 明细
+    pub marketing: Option<HttpMeta>,
+    pub elapsed_ms: u64,
+}
+
+/// 单个通道的传输层摘要：只放数字与枚举，便于两端日志对比。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpMeta {
+    pub status: u16,
+    /// 业务码；响应非 JSON 时为 -1
+    pub code: i64,
+    pub count: usize,
+    pub transport: String,
+}
+
+impl HttpMeta {
+    fn of(resp: &quota::HttpResp) -> Self {
+        Self {
+            status: resp.status,
+            code: -1,
+            count: 0,
+            transport: resp.transport.to_string(),
+        }
+    }
 }
 
 /// 可领套餐统一查询入口：billing/preview（错误上抛，保持既有报错体验）
@@ -802,15 +864,17 @@ pub fn collect_claimable_plans_diag(
     config: Option<&Value>,
     device_mid: String,
 ) -> Result<(Vec<ClaimPlan>, ClaimDiag), String> {
+    let started = std::time::Instant::now();
     // 双通道互为兜底：preview 失败不立即整单失败，先看 marketing 有没有货
-    let (plans, preview_error) = match preview_plans(home, creds, config, Some(device_mid.clone())) {
-        Ok(p) => (p, None),
-        Err(e) => {
-            flowlog::log("claim", "preview-fail", &e);
-            (Vec::new(), Some(e))
-        }
-    };
-    let extra = marketing_touch_plans(home, creds, config, Some(device_mid));
+    let (plans, preview_error, preview_meta) =
+        match preview_plans_meta(home, creds, config, Some(device_mid.clone())) {
+            Ok((p, m)) => (p, None, Some(m)),
+            Err(e) => {
+                flowlog::log("claim", "preview-fail", &e);
+                (Vec::new(), Some(e), None)
+            }
+        };
+    let (extra, marketing_meta) = marketing_touch_plans_meta(home, creds, config, Some(device_mid));
     // 两通道都没货且 preview 有错 → 保留既有报错体验（不吞真实故障）
     if plans.is_empty() && extra.is_empty() {
         if let Some(e) = &preview_error {
@@ -821,6 +885,9 @@ pub fn collect_claimable_plans_diag(
         preview_empty: plans.is_empty(),
         marketing_empty: extra.is_empty(),
         preview_error,
+        preview: preview_meta,
+        marketing: Some(marketing_meta),
+        elapsed_ms: started.elapsed().as_millis() as u64,
     };
     Ok((merge_marketing_plans(plans, extra), diag))
 }
