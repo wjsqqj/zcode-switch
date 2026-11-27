@@ -19,12 +19,10 @@ jobs:
             bundles: nsis
           # GitHub 已于 2026-11-02 退役 macOS 14 镜像（macos-14 / macos-14-large / macos-14-xlarge），
           # 使用会直接报 "The configuration 'macos-14-arm64-us-default' is not supported"。
-          # 固定 macos-15（arm64），第二个 job 交叉编译 x64。
+          # 只占一个 macOS runner：arm64 正常构建，x64 在同一 job 里交叉编译后上传，
+          # 避免两个 macOS job 同时排队导致第二个被 GitHub 取消。
           - os: macos-15
             bundles: dmg
-          - os: macos-15
-            bundles: dmg
-            rust_target: x86_64-apple-darwin
           - os: ubuntu-22.04
             bundles: deb,appimage
 
@@ -44,6 +42,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+
+      - name: Add macOS x64 Rust target
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -137,6 +139,16 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-beta') }}
           makeLatest: 'true'
           args: --bundles ${{ matrix.bundles }} ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) || '' }}
+
+      # 在同一个 macOS runner 里补 x64 dmg，避免第二个 macOS job 排队被取消。
+      - name: Build macOS x64 dmg
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm run tauri build -- --bundles dmg --target x86_64-apple-darwin
+          gh release upload "$GITHUB_REF_NAME" src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg --clobber
 
       - name: Upload portable exe + checksums (windows)
         if: runner.os == 'Windows'
