@@ -19,12 +19,23 @@ pub const OAUTH_PROVIDERS: &[OAuthProvider] = &[
     OAuthProvider { id: "zai", display: "z.ai（国际站）" },
 ];
 
+/// z.ai 登录的实际上游 provider：
+/// - 未开「授权登录走代理」：走中国站 `zai_cn`（授权入口 `zchat.z.ai`，只支持手机号）。
+/// - 开了代理：走国际站 `zai`（授权入口 `chat.z.ai`，按海外出口 IP 显示邮箱 / Google / GitHub）。
+/// 本地 provider id 仍是 `zai`，账号存储、配置与既有账号都不受影响。
+fn upstream_provider(provider: &str, use_proxy: bool) -> &str {
+    match (provider, use_proxy) {
+        ("zai", false) => "zai_cn",
+        (other, _) => other,
+    }
+}
+
 const REDIRECT_ENC: &str = "zcode%3A%2F%2Foauth%2Fcallback";
 
-/// z.ai 官网登录入口（官网 OAuth client：邮箱 / 第三方登录方式齐全）。
-/// zcode 的 API 授权 client 只放手机号登录，所以 zai 入口先用这个页面建立 chat.z.ai 会话，
-/// 登录成功后（回调 z.ai/login/callback）再接力到本次 flow 的 authorize_url 取码。
-pub const ZAI_LOGIN_ENTRY_URL: &str = "https://chat.z.ai/auth?response_type=code&client_id=client_lS94_Ka2ycE9IwCNYisudg&redirect_uri=https%3A%2F%2Fz.ai%2Flogin%2Fcallback%3Fredirect%3D%2525252Fmodel-api&state=1790259680634";
+/// 手机号登录入口：中国站 `zchat.z.ai/auth`（用户实测可用的手机号登录页）。
+/// 国际站 CLI 授权入口会把中国手机号导向「正在跳转至中国站点」提示页，
+/// 辅助条的手机号按钮直接落到这里完成登录，再由 `lib.rs` 接力回本次 flow 取码。
+pub const ZCHAT_LOGIN_ENTRY_URL: &str = "https://zchat.z.ai/auth";
 
 /// z.ai 登录窗口内的辅助按钮条：手机号 / Google / GitHub / 邮箱登录 / 邮箱注册。
 /// 登录页把「邮箱表单」和「手机号表单」放在同一个页面上（手机号表单默认隐藏），所以按钮一律
@@ -65,6 +76,9 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
   var TOGGLE_MAX = [24, 12];
   var INTENT_KEY = 'zsw_email_assist_intent';
   var BAR_ID = 'zsw-email-assist';
+  // 是否显示邮箱 / 注册 / GitHub / Google 按钮：由「授权登录走代理」开关决定。
+  // 走代理（海外出口）时 z.ai 会显示这些登录方式；国内直连只保留手机号。
+  var SHOW_EXTRA = __ZSW_SHOW_EXTRA__;
   var BTN_STYLE = 'cursor:pointer;border:1px solid rgba(255,255,255,.3);background:rgba(20,20,24,.88);color:#fff;border-radius:999px;padding:6px 12px;font:12px/1 system-ui,sans-serif;white-space:nowrap';
   var norm = function (s) { return (s || '').replace(/\s+/g, '').toLowerCase(); };
   var barEl = function () { return document.getElementById(BAR_ID); };
@@ -271,10 +285,12 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
   };
   var openPhone = function (ev) {
     ev.preventDefault(); ev.stopPropagation();
-    // 还停在 GitHub / Google 等第三方页：那里没有我们的表单，只能整页回 z.ai，意图靠 fragment 带过去
-    if (!ZAI_HOST) { goEntry(PHONE_INTENT_KEY, '1', PHONE_ENTRY, 'phone'); return; }
-    if (formShown('phone')) { hint(LBL.alreadyPhone); return; }
-    if (switchPhone()) return;
+    // 手机号登录固定走中国站入口：国际站 / CLI 页面即使能页内切出手机号表单，
+    // 那条链路仍会把中国手机号导向「正在跳转至中国站点」提示页，所以一律整页跳转。
+    // 只有已经落在目标入口且目标表单可见时才提示，不再重复跳转。
+    if (/^zchat\.z\.ai$/i.test(location.hostname)
+        && location.pathname === '/auth'
+        && formShown('phone')) { hint(LBL.alreadyPhone); return; }
     goEntry(PHONE_INTENT_KEY, '1', PHONE_ENTRY, 'phone');
   };
   var consumePhone = function () {
@@ -366,10 +382,12 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
       return b;
     };
     wrap.appendChild(mkBtn(LBL.phone, openPhone));
-    wrap.appendChild(mkBtn(LBL.google, clickProvider(['google'], 'button[class*="ButtonContinueWithGoogle"]', GOOGLE_ENTRY)));
-    wrap.appendChild(mkBtn(LBL.github, clickProvider(['github'], 'button[class*="ButtonContinueWithGithub"]', GITHUB_ENTRY)));
-    wrap.appendChild(mk(LBL.login, false));
-    wrap.appendChild(mk(LBL.signup, true));
+    if (SHOW_EXTRA) {
+      wrap.appendChild(mkBtn(LBL.google, clickProvider(['google'], 'button[class*="ButtonContinueWithGoogle"]', GOOGLE_ENTRY)));
+      wrap.appendChild(mkBtn(LBL.github, clickProvider(['github'], 'button[class*="ButtonContinueWithGithub"]', GITHUB_ENTRY)));
+      wrap.appendChild(mk(LBL.login, false));
+      wrap.appendChild(mk(LBL.signup, true));
+    }
     var t = document.createElement('div');
     t.setAttribute('data-hint', '1');
     t.setAttribute('style', 'opacity:0;transition:opacity .2s;background:rgba(20,20,24,.9);color:#fff;border-radius:6px;padding:5px 9px;font:11px/1.2 system-ui,sans-serif');
@@ -378,7 +396,7 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
     document.body.appendChild(bar);
   };
   // 授权确认页自动点「授权」：第三方登录（Google / GitHub）回调后常停在这一页，
-  // 按钮文案不固定，先按关键词找；找不到时若页面上只有一个可点按钮也点它（排除取消 / 返回 / 登录类）。
+  // 按钮文案不固定，先按关键词找；找不到时若页面上只有一个可点按钮也点它（只排除取消 / 返回类）。
   // 官网登录成功可能是 SPA 内部路由切到授权页（不再触发注入），所以这里常驻轮询而不是一次性判断。
   var autoAuthorize = function () {
     poll('authorize', 600, 500, function () {
@@ -392,7 +410,9 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
         var raw = (el.innerText || '').trim();
         var txt = norm(raw);
         if (!raw || raw.length > 24) continue;
-        if (/cancel|deny|拒绝|取消|返回|back|login|sign|登录/.test(txt)) continue;
+        // 不能排除「登录」：授权确认页的按钮常写作「确认登录 / 同意并登录」，
+        // 排除它会导致授权按钮永远点不到，页面停在授权页不动。
+        if (/cancel|deny|拒绝|取消|返回|back/.test(txt)) continue;
         if (/授权|同意|允许|authorize|allow|agree|continue|确认|继续/.test(txt)) { hit = el; break; }
         others.push(el);
       }
@@ -402,22 +422,56 @@ const ZAI_EMAIL_ASSIST_JS: &str = r##"(function () {
       return true;
     });
   };
+  // 手机号登录页的协议勾选框：不勾就发不出验证码。只认文案命中且可见的 checkbox / label，
+  // 已勾选就收工；重复注入靠 poll 去重，不会叠加定时器或反复切换勾选状态。
+  var agreeText = function (txt) {
+    return txt.indexOf(norm('我已阅读并同意')) >= 0
+      || (txt.indexOf(norm('用户协议')) >= 0 && txt.indexOf(norm('隐私政策')) >= 0)
+      || txt.indexOf(norm('agree to')) >= 0;
+  };
+  var findAgreeBox = function () {
+    var all = document.querySelectorAll('input[type="checkbox"],[role="checkbox"],label');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (inBar(el)) continue;
+      var lab = el.tagName === 'LABEL' ? el : (el.parentElement && el.parentElement.tagName === 'LABEL' ? el.parentElement : null);
+      var txt = norm((lab ? lab.innerText : (el.innerText || '')) + ' ' + (el.getAttribute('aria-label') || ''));
+      if (!agreeText(txt)) continue;
+      if (visible(el) || (lab && visible(lab))) return el;
+    }
+    return null;
+  };
+  var autoAgree = function () {
+    poll('agree', 120, 300, function () {
+      if (!ZAI_HOST) return false;
+      var el = findAgreeBox();
+      if (!el) return false;
+      var box = el.tagName === 'LABEL' && el.querySelector ? el.querySelector('input[type="checkbox"],[role="checkbox"]') : el;
+      var checked = box && (box.checked === true || box.getAttribute('aria-checked') === 'true');
+      if (checked) return true;
+      (box || el).click();
+      return false; // 下一轮复核，确保真的勾上
+    });
+  };
   var bootTries = 0;
   // 注入会被反复触发（on_page_load + 窗口起来后的补注入），render 靠 BAR_ID 幂等，
   // 各路轮询靠 poll 里的 window 标记去重，所以每次注入都可以直接再调一遍。
   var boot = function () {
-    if (document.body) { adoptHashIntent(); render(); consume(); consumePhone(); autoAuthorize(); return; }
+    if (document.body) { adoptHashIntent(); render(); consume(); consumePhone(); autoAuthorize(); autoAgree(); return; }
     if (++bootTries > 50) return;
     setTimeout(boot, 100);
   };
   boot();
 })();"##;
 
-pub fn zai_email_assist_script(phone_entry: &str) -> String {
+pub fn zai_email_assist_script(entry_url: &str, show_extra: bool) -> String {
     let lit = |s: String| serde_json::Value::String(s).to_string();
     ZAI_EMAIL_ASSIST_JS
-        .replace("__ZSW_PHONE_ENTRY__", &lit(phone_entry.to_string()))
-        .replace("__ZSW_ENTRY__", &lit(ZAI_LOGIN_ENTRY_URL.to_string()))
+        .replace("__ZSW_PHONE_ENTRY__", &lit(ZCHAT_LOGIN_ENTRY_URL.to_string()))
+        // 邮箱 / 注册回跳也走本次 flow 的 CLI 授权入口：它自带邮箱表单，登录后直接回调 zcode。
+        // 旧版用官网入口（client_lS94 → z.ai/login/callback）会落在不同子域，接力取码被服务端弹回。
+        .replace("__ZSW_ENTRY__", &lit(entry_url.to_string()))
+        .replace("__ZSW_SHOW_EXTRA__", if show_extra { "true" } else { "false" })
         .replace("__ZSW_LABEL_EMAIL_LOGIN__", &lit(crate::i18n::tr("login.assist.email")))
         .replace("__ZSW_LABEL_PHONE_LOGIN__", &lit(crate::i18n::tr("login.assist.phone")))
         .replace("__ZSW_LABEL_GOOGLE_LOGIN__", &lit(crate::i18n::tr("login.assist.google")))
@@ -454,10 +508,11 @@ mod assist_tests {
                 assert!(!v.is_empty(), "{lang:?} 文案 {key} 为空");
                 assert_eq!(v.is_ascii(), lang == Lang::En, "{key} 的 {lang:?} 文案不对：{v}");
             }
-            let js = zai_email_assist_script("https://chat.z.ai/auth?x=1");
+            let js = zai_email_assist_script("https://chat.z.ai/auth?client_id=cli-test&x=1", false);
             assert!(!js.contains("__ZSW_"), "{lang:?} 注入脚本有未替换的占位符");
+            assert!(js.contains("https://zchat.z.ai/auth"), "{lang:?} 手机号入口未指向 zchat.z.ai/auth");
             // 同页表单判定 / 第三方域名收敛 / 页内切换 / 去重轮询，缺一个就是本次改动回归
-            for token in ["ZAI_HOST", "formShown", "switchPhone", "switchEmail", "poll("] {
+            for token in ["ZAI_HOST", "formShown", "switchPhone", "switchEmail", "poll(", "autoAgree", "我已阅读并同意", "SHOW_EXTRA"] {
                 assert!(js.contains(token), "{lang:?} 注入脚本缺少 {token}");
             }
         }
@@ -479,6 +534,11 @@ fn urlencode(s: &str) -> String {
 
 pub struct FlowInit {
     pub authorize_url: String,
+    /// 服务端原始 authorize_url（/api/oauth/authorize），首屏直接用它：未登录服务端 307 到登录页，
+    /// 已登录直接发码，避免 normalize 后的 /auth 页面把 redirect 拼成 /auth/oauth/authorize 死循环。
+    pub raw_authorize_url: String,
+    /// 本次 flow 的实际上游 provider（`zai` 或 `zai_cn`）：落库时要据此决定是否换业务令牌。
+    pub upstream_provider: String,
     pub state: String,
     pub poll_url: String,
     pub poll_token: String,
@@ -492,11 +552,12 @@ pub fn new_poll_token() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn init_flow(provider: &str, mid: &str) -> Result<FlowInit, String> {
-    init_flow_at(FLOW_INIT_URL, provider, mid)
+pub fn init_flow(provider: &str, mid: &str, use_proxy: bool) -> Result<FlowInit, String> {
+    init_flow_at(FLOW_INIT_URL, provider, mid, use_proxy)
 }
 
-fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String> {
+fn init_flow_at(url: &str, provider: &str, mid: &str, use_proxy: bool) -> Result<FlowInit, String> {
+    let upstream = upstream_provider(provider, use_proxy);
     let poll_token = new_poll_token();
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
@@ -507,7 +568,7 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         req = req.set(&k, &v);
     }
     let resp = req
-        .send_json(json!({ "provider": provider }))
+        .send_json(json!({ "provider": upstream }))
         .map_err(|e| crate::i18n::trf("err.oauth.init", &[("e", &e.to_string())]))?
         .into_string()
         .map_err(|e| crate::i18n::trf("err.oauth.init", &[("e", &e.to_string())]))?;
@@ -522,7 +583,7 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         .ok_or_else(invalid)?;
     let authorize_raw = data.get("authorize_url").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
         .ok_or_else(invalid)?;
-    let authorize = match normalize_zai_authorize_entry(provider, authorize_raw) {
+    let authorize = match normalize_zai_authorize_entry(upstream, authorize_raw) {
         Some(u) => u,
         None => authorize_raw.to_string(),
     };
@@ -561,6 +622,8 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         .map_err(|_| invalid())?;
     Ok(FlowInit {
         authorize_url: auth_url.to_string(),
+        raw_authorize_url: authorize_raw.to_string(),
+        upstream_provider: upstream.to_string(),
         state,
         poll_url: format!("{init_base}/api/v1/oauth/cli/poll/{}", urlencode(flow_id)),
         poll_token,
@@ -656,7 +719,11 @@ pub fn poll_flow_once(url: &str, poll_token: &str, mid: &str) -> Result<PollOutc
                     .map(String::from)
             };
             let token = br_str("/token");
-            let access = match data.get("zai").or_else(|| data.get("bigmodel")) {
+            let access = match data
+                .get("zai_cn")
+                .or_else(|| data.get("zai"))
+                .or_else(|| data.get("bigmodel"))
+            {
                 Some(p) => br_str2(p, &["access_token", "accessToken"]),
                 None => None,
             };
@@ -830,7 +897,7 @@ pub fn exchange_token(provider: &str, code: &str, state: &str, mid: &str) -> Res
 }
 
 pub fn extract_user_profile(provider: &str, raw: &Value) -> Option<Value> {
-    if provider != "zai" {
+    if provider != "zai" && provider != "zai_cn" {
         return None;
     }
     raw.pointer("/data/user").and_then(backend_user_profile)
@@ -947,6 +1014,8 @@ pub fn assemble_credentials_with_token(
 pub const BIGMODEL_BIZ_BASE: &str = "https://bigmodel.cn";
 pub const ZAI_API_BASE: &str = "https://api.z.ai";
 pub const ZAI_BUSINESS_LOGIN_URL: &str = "https://api.z.ai/api/auth/z/login";
+/// 中国站业务登录端点：`zai_cn` 的 access token 在这里换取业务令牌。
+pub const ZAI_CN_BUSINESS_LOGIN_URL: &str = "https://open.bigmodel.cn/api/auth/z/login";
 pub const BIGMODEL_ANTHROPIC_BASE: &str = "https://open.bigmodel.cn/api/anthropic";
 pub const ZAI_ANTHROPIC_BASE: &str = "https://api.z.ai/api/anthropic";
 pub const START_PLAN_ANTHROPIC_BASE: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
@@ -971,7 +1040,11 @@ pub fn extract_access_token(provider: &str, raw: &Value) -> Option<String> {
     let data = raw.get("data")?;
     match provider {
         "bigmodel" => data.get("bigmodel").and_then(&pick).or_else(|| pick(data)),
-        "zai" => data.get("zai").and_then(&pick),
+        // zai 走中国站 zai_cn 的 OAuth 流程，回调字段可能是 zai_cn 或 zai
+        "zai" | "zai_cn" => data
+            .get("zai_cn")
+            .or_else(|| data.get("zai"))
+            .and_then(&pick),
         _ => None,
     }
 }
@@ -1079,18 +1152,37 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Opti
 }
 
 pub fn resolve_zai_business_token(zai_access_token: &str) -> Option<String> {
-    resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token)
+    // zai 走中国站（zai_cn）OAuth：access token 必须用中国站业务登录端点换取，
+    // 国际站 api.z.ai 会返回 "Z.ai user information is invalid"。国际站端点作为兜底。
+    resolve_zai_business_token_at(ZAI_CN_BUSINESS_LOGIN_URL, zai_access_token)
+        .or_else(|| resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token))
 }
 
 fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Option<String> {
-    let resp = web_agent()
+    let resp = match web_agent()
         .post(url)
         .set("Content-Type", "application/json")
+        .set("User-Agent", "ZCode/4.0.0")
+        .set("X-ZCode-App-Version", "4.0.0")
+        .set("X-Platform", "win32-x64")
         .send_json(json!({ "token": zai_access_token }))
-        .ok()?
-        .into_string()
-        .ok()?;
-    let v: Value = serde_json::from_str(&resp).ok()?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::flowlog::log("zai-biz", "http-fail", &format!("{url} {e}"));
+            return None;
+        }
+    };
+    let status = resp.status();
+    let body = resp.into_string().unwrap_or_default();
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let code = v.get("code").and_then(|c| c.as_i64());
+    let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+    crate::flowlog::log(
+        "zai-biz",
+        "exchange",
+        &format!("{url} status={status} code={code:?} msg={msg} token_len={}", zai_access_token.len()),
+    );
     ["access_token", "accessToken"]
         .iter()
         .find_map(|k| {

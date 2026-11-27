@@ -21,8 +21,8 @@ pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/qu
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
 /// 最新已知的官方客户端版本（无 ZCode 安装 / 离线 / changelog 拉取失败时的兜底）。
-/// 2026-11-03 官方已发布 V3.17.2：活动按 `X-ZCode-App-Version` 下发，常量落后会导致被过滤。
-pub const CLIENT_APP_VERSION: &str = "3.17.2";
+/// 2026-11-27 官方已发布 V4.0.0：活动按 `X-ZCode-App-Version` 下发，常量落后会导致被过滤。
+pub const CLIENT_APP_VERSION: &str = "4.0.0";
 
 pub(crate) fn client_platform() -> String {
     let os = crate::zcrypto::node_platform_for(std::env::consts::OS);

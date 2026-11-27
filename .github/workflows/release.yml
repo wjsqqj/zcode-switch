@@ -59,7 +59,26 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'Z·SWITCH ${{ github.ref_name }}'
           releaseBody: |
-            ## 本次更新（v1.7.5-Z.EMAIL）
+            ## 本次更新（v1.7.6-Z.EMAIL）
+
+            ### 修复：z.ai 手机号登录恢复可用
+
+            - 按「授权登录走代理」选择上游：关闭时走中国站 zai_cn（zchat.z.ai），开启时走国际站 zai（chat.z.ai）
+            - 对齐 ZCode 4.0.0 契约：zai_cn 的 access_token 直接落库，不再送 /api/auth/z/login 换业务令牌
+            - 修复 Tauri 2.11.5 的 proxy_url 在 Windows/WebView2 不生效：登录窗口改用 --proxy-server 启动参数
+            - 修复 GitHub / 邮箱回调后的 relay 循环：relay 目标改用原始授权端点
+            - 活动 / 套餐探测版本号升级到 4.0.0
+
+            ### 调整：暂时隐藏非手机号登录入口
+
+            - 辅助条去掉「邮箱登录 / 邮箱注册 / GitHub / Google」按钮，默认只保留「手机号登录」
+            - 开启「授权登录走代理」时仍会显示，供国际站账号使用；底层逻辑保留，等后续有突破再恢复
+
+            ### 已知限制
+
+            - 中国区账号用 z.ai 国际站入口 + GitHub/邮箱登录会被服务端按账号区域强制跳 zchat，客户端无法绕过
+
+            ### 上一版（v1.7.5）主要内容
 
             ### 新增：macOS 原生 Liquid Glass 界面（感谢 @245678000000）
 

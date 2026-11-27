@@ -54,6 +54,41 @@ login page, because the CLI authorize page does not always expose every sign-in 
 6. **Injected script stays ES5, single IIFE, no `const`/`let`/arrow/template literals** — it runs in
    WebView2 against pages we do not control. Placeholders are `__ZSW_*__` and are filled from
    `crate::i18n::tr(...)`; adding one means adding the key to *both* ZH and EN tables.
+7. **手机号入口固定为中国站 `zchat.z.ai/auth`.** The login window's **initial entry** for the
+   `zai` provider is `oauth::ZCHAT_LOGIN_ENTRY_URL`, and `__ZSW_PHONE_ENTRY__` takes the same value
+   — never the CLI `authorize_url`. The international CLI entry redirects a mainland phone number
+   to a "正在跳转至中国站点" notice instead of a usable form; both the first page and the assist
+   bar must land on the working phone-login page. The CLI authorize URL is used only as the relay
+   target after login. `openPhone()` is an explicit exception to Rule 3: it **always** navigates to
+   `PHONE_ENTRY`, never switches an in-page phone tab — otherwise clicking 邮箱登录 then 手机号登录
+   on the international page leaves the user on the old CLI form. Only when already on
+   `zchat.z.ai/auth` with the phone form visible does it show the "already" hint.
+   **Email / signup / third-party buttons follow the auth-proxy switch**: `SHOW_EXTRA` is filled
+   from `proxy_url.is_some()` in `oauth_begin`. With 「授权登录走代理」on, the login window exits via
+   an overseas proxy, `init_flow` uses upstream `zai` (`chat.z.ai`) and the bar shows
+   email/signup/Google/GitHub; with it off, upstream is `zai_cn` (`zchat.z.ai`) and only the phone
+   button is shown. Handlers (`openEmail`, `clickProvider`) stay intact in both modes.
+9. **Auto-check the phone-login agreement checkbox.** The zchat phone form cannot send an SMS code
+   until "我已阅读并同意用户协议、隐私政策和Z.AI账号服务须知" is checked. `autoAgree()` uses the
+   shared `poll()` dedupe, matches the checkbox / label by agreement copy (or `agree to` in EN),
+   clicks only when unchecked, and stops once checked — never toggles it twice.
+8. **Upstream provider follows the auth-proxy switch.** With 「授权登录走代理」off, `oauth::upstream_provider`
+   maps `zai` → `zai_cn` (`zchat.z.ai`, phone only); with it on, `zai` stays `zai` (`chat.z.ai`,
+   email/Google/GitHub via the overseas exit IP). The chosen upstream is stored in
+   `FlowInit.upstream_provider`, carried through `PendingOAuth.upstream`, and passed to
+   `persist_oauth_account`.
+   **Never exchange a `zai_cn` access token at `/api/auth/z/login`**: ZCode 4.0.0's
+   `zaiProviderAdapter` uses `tokenSet.accessToken` as-is for `zai_cn`, and the global business-login
+   endpoint rejects it (`z.ai 用户信息异常` / `Z.ai user information is invalid`). `zai_cn` persists
+   `data.zai.access_token` directly; only upstream `zai` calls `resolve_zai_business_token`.
+   Paid-plan material for `zai_cn` comes from `data.bigmodel` (`customer_id` + `access_token`), and
+   its Start Plan family is `bigmodel`. `is_authorize_page` treats `/auth/oauth/authorize` as a real
+   authorize page (the zchat confirmation page); do not correct or re-relay it. The relay host
+   allowlist is `{z.ai, chat.z.ai, zchat.z.ai}`.
+   **Windows proxy caveat:** Tauri 2.11.5's `WebviewWindowBuilder::proxy_url` only stores the field
+   and does not forward it to wry's `proxy_config`, so it has no effect on WebView2. The login window
+   therefore also sets `--proxy-server=<url>` via `additional_browser_args`; keep both so platforms
+   that honor `proxy_url` still work.
 
 ## Verification
 
@@ -68,6 +103,7 @@ The harness loads the JS straight out of `oauth.rs`, fills the placeholders, and
 
 ## Related
 
-- Task: `.trellis/tasks/10-27-login-assist-tab-switch/` (PRD = requirement + AC source)
+- Tasks: `.trellis/tasks/10-27-login-assist-tab-switch/` (original requirement + AC source),
+  `.trellis/tasks/11-27-zai-intl-login-fix/` (phone entry = zchat.z.ai/auth + malformed-path correction)
 - Relay logic that must not break: `oauth_begin`'s `on_navigation` + `is_login_page` /
   `is_authorize_page` in `src-tauri/src/lib.rs`.

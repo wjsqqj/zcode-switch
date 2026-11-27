@@ -846,6 +846,8 @@ fn close_captcha_window(app: &AppHandle) {
 
 struct PendingOAuth {
     provider: String,
+    /// 本次 flow 的实际上游 provider（`zai` / `zai_cn`）：落库时决定是否换业务令牌。
+    upstream: String,
     state: String,
     flow: String,
 }
@@ -889,10 +891,11 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         let _ = w.close();
     }
     let flow = uuid::Uuid::new_v4().to_string();
-    flowlog::log(&flow, "begin", &format!("provider={provider} proxy={}", if proxy_url.is_some() { "on" } else { "off" }));
+    let use_proxy = proxy_url.is_some();
+    flowlog::log(&flow, "begin", &format!("provider={provider} proxy={}", if use_proxy { "on" } else { "off" }));
     let mid = uuid::Uuid::new_v4().to_string();
     let (p_init, m_init) = (provider.clone(), mid.clone());
-    let init = match tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init))
+    let init = match tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init, use_proxy))
         .await
     {
         Ok(Ok(v)) => v,
@@ -925,9 +928,15 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     // 会因缺少 chat.z.ai 会话被弹回登录页；走 /auth 可完成登录/SSO。
     // 非 zai 或未规范化时 authorize_url 就是服务端原始地址。
     let url = init.authorize_url.clone();
-    // zai：默认直接打开本次 flow 的 CLI 授权入口（chat.z.ai/auth?client_id=<CLI>&...）。
-    // 在该页用手机号 / 邮箱登录会直接建立 chat.z.ai 会话并续到授权/回调，不依赖官网跨站会话。
-    let entry_url = url.clone();
+    // zai：首屏用服务端原始授权端点 /api/oauth/authorize（未登录时它自己 307 到 /auth
+    // 建立会话，已登录时直接发码）。不能用 normalize 后的 /auth?... —— 那个页面登录成功后
+    // 会把 redirect 拼成 /auth/oauth/authorize，回到登录页形成死循环。
+    // 手机号仍由辅助条按钮引导到 zchat.z.ai/auth，但中国站会话带不回 chat.z.ai（服务端限制）。
+    let entry_url = if provider == "zai" {
+        init.raw_authorize_url.clone()
+    } else {
+        url.clone()
+    };
     let poll_cfg = PollCfg {
         url: init.poll_url.clone(),
         token: init.poll_token.clone(),
@@ -936,6 +945,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     };
     *pending_oauth_guard() = Some(PendingOAuth {
         provider: provider.clone(),
+        upstream: init.upstream_provider.clone(),
         state: init.state.clone(),
         flow: flow.clone(),
     });
@@ -951,8 +961,21 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     let app2 = app.clone();
     let (provider2, state2, flow2, mid2) = (provider.clone(), init.state.clone(), flow.clone(), mid.clone());
     let flow_close = flow.clone();
-    let relay_to = url.clone();
-    let relay_to2 = url.clone();
+    // relay 目标用服务端原始授权端点：已登录时直接发码/回调，避免 normalize 的 /auth 页面
+    // 在 GitHub / 邮箱登录后又被当成登录页，形成 /auth → /api/oauth/authorize → /auth/oauth/authorize 循环。
+    let relay_to = if provider == "zai" {
+        init.raw_authorize_url.clone()
+    } else {
+        url.clone()
+    };
+    let relay_to2 = relay_to.clone();
+    // relay 目标本身是 /auth?client_id=<CLI>，也是登录页形态。
+    // 用 client_id 区分「官网登录入口」与「CLI 授权入口」，避免 relay 落地后被误判为「回到登录页」重新武装。
+    let cli_client_id: Option<String> = url
+        .parse::<tauri::Url>()
+        .ok()
+        .and_then(|u| u.query_pairs().find(|(k, _)| k == "client_id").map(|(_, v)| v.into_owned()));
+    let cli_client_id_nav = cli_client_id.clone();
     let relay_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(provider == "zai"));
     let relay_armed2 = relay_armed.clone();
     let relay_armed3 = relay_armed.clone();
@@ -973,12 +996,20 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
     .user_agent(oauth::LOGIN_WINDOW_UA)
     .data_directory(profile_dir);
     if let Some(u) = proxy_url {
-        builder = builder.proxy_url(u);
+        // Tauri 2.11.5 的 WebviewWindowBuilder::proxy_url 只保存字段，没有下发到 wry/WebView2，
+        // Windows 上实际不生效（日志 proxy=on 但出口 IP 仍是国内，页面继续跳 zchat）。
+        // 用 WebView2 的 --proxy-server 启动参数兜底；proxy_url 保留给支持它的平台。
+        let proxy = u.as_str().trim_end_matches('/').to_string();
+        builder = builder
+            .proxy_url(u)
+            .additional_browser_args(&format!(
+                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-server={proxy}"
+            ));
     }
     // z.ai：邮箱 / 手机号两个表单在同一个登录页上（手机号默认隐藏），页内切换优先，
     // 页面每次加载后注入按钮条，用户随时可切回邮箱登录 / 邮箱注册
     if provider == "zai" {
-        let assist = oauth::zai_email_assist_script(&init.authorize_url);
+        let assist = oauth::zai_email_assist_script(&init.authorize_url, use_proxy);
         let assist_load = assist.clone();
         let flow_load = flow.clone();
         builder = builder.on_page_load(move |wv, payload| {
@@ -1016,7 +1047,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             });
             return false;
         }
-        if log_nav && url.host_str().map_or(false, |h| h.ends_with("z.ai")) {
+        if log_nav && url.host_str().map_or(false, is_zai_login_host) {
             // 只标记是否带 error 参数，不落 query（可能含 code / state 等敏感值）
             let mark = if url.query().map_or(false, |q| q.contains("error")) { " (error)" } else { "" };
             flowlog::log(&flow_nav, "nav", &format!("{}{}{}", url.host_str().unwrap_or(""), url.path(), mark));
@@ -1025,12 +1056,12 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         let nav_path = url.path();
         // 接力状态跟随登录态：授权链路中收枪（避免打断正在进行的授权），
         // 回到登录页（含第三方登录入口）重新武装，保证再次登录完成后仍能取码
-        if nav_host == "z.ai" || nav_host == "chat.z.ai" {
+        if is_zai_login_host(nav_host) {
             if is_authorize_page(nav_path) {
                 if relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     flowlog::log(&flow_relay, "relay-disarm", &format!("{nav_host}{nav_path}"));
                 }
-            } else if is_login_page(nav_path) {
+            } else if is_login_page(nav_path) && !is_cli_authorize_entry(url, cli_client_id_nav.as_deref()) {
                 if !relay_armed2.load(std::sync::atomic::Ordering::SeqCst) {
                     flowlog::log(&flow_relay, "relay-rearm", &format!("{nav_host}{nav_path}"));
                     relay_armed2.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1038,7 +1069,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             }
         }
         // zai 第一段（登录页）完成 → 接力到本次 flow 的授权入口取码（此时已登录，不再要求手机号）
-        if (nav_host == "z.ai" || nav_host == "chat.z.ai")
+        if is_zai_login_host(nav_host)
             && !is_login_page(nav_path)
             && !is_authorize_page(nav_path)
             && relay_armed2.swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -1091,6 +1122,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         let target = relay_to2;
         let fl = flow_relay2;
         let guard_flow = flow.clone();
+        let cli_client_id_poll = cli_client_id.clone();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             while std::time::Instant::now() < deadline {
@@ -1103,7 +1135,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
                 let Ok(u) = w.url() else { continue };
                 let host = u.host_str().unwrap_or("");
                 let path = u.path();
-                if !(host == "z.ai" || host == "chat.z.ai") {
+                if !is_zai_login_host(host) {
                     continue;
                 }
                 if is_authorize_page(path) {
@@ -1111,7 +1143,9 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
                     continue;
                 }
                 if is_login_page(path) {
-                    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if !is_cli_authorize_entry(&u, cli_client_id_poll.as_deref()) {
+                        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     continue;
                 }
                 if !armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1127,7 +1161,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
             }
         });
     }
-    spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
+    spawn_poll_loop(app.clone(), provider.clone(), init.upstream_provider.clone(), flow.clone(), mid, poll_cfg);
     Ok(json!({ "opened": true, "provider": provider }))
 }
 
@@ -1153,10 +1187,26 @@ fn is_login_page(path: &str) -> bool {
 
 /// 已在授权链路中（授权入口 / 授权确认页）：让页面自行走完，不能再接力，
 /// 否则会把正在进行的授权打断，被服务端弹回登录页。
+/// 中国站 zchat.z.ai 的 `/auth/oauth/authorize` 就是正常授权确认页，必须按授权页处理。
 fn is_authorize_page(path: &str) -> bool {
     path.ends_with("/oauth/authorize")
 }
 
+/// z.ai 登录链路涉及的域名：国际站主域 / 聊天域 / 中国站手机号入口。
+fn is_zai_login_host(host: &str) -> bool {
+    matches!(host, "z.ai" | "chat.z.ai" | "zchat.z.ai")
+}
+
+/// CLI 授权入口形态：/auth?client_id=<本次 flow 的 CLI client_id>。
+/// relay 导航到这里时不能再当成「回到登录页」重新武装，否则授权链路会反复 disarm/rearm。
+fn is_cli_authorize_entry(url: &tauri::Url, cli_client_id: Option<&str>) -> bool {
+    let Some(cli) = cli_client_id else { return false };
+    url.path() == "/auth"
+        && url.query_pairs().any(|(k, v)| k == "client_id" && v == cli)
+}
+
+/// 畸形路径一次性纠正：主动导航回本次 flow 的 authorize_url（参数沿用服务端下发值）。
+/// 用 AtomicBool 去重，避免在畸形路径与授权入口之间来回跳转。
 fn sweep_login_profiles(root: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(root) else { return };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
@@ -1198,16 +1248,18 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
         let mid = mid.clone();
         let callback_url = callback_url.to_string();
         tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
-            {
+            let upstream = {
                 let pending = pending_oauth_guard();
                 match pending.as_ref() {
-                    Some(p) if p.provider == provider && p.state == state && p.flow == flow => {}
+                    Some(p) if p.provider == provider && p.state == state && p.flow == flow => {
+                        p.upstream.clone()
+                    }
                     Some(_) | None => {
                         flowlog::log(&flow, "deeplink-superseded", "");
                         return Err("__superseded__".into());
                     }
                 }
-            }
+            };
             let (code, cb_state) = match oauth::parse_callback(&callback_url) {
                 Ok(oauth::CallbackKind::Code { code, state }) => (code, state),
                 Ok(oauth::CallbackKind::Attribution) => {
@@ -1223,14 +1275,14 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
                 flowlog::log(&flow, "deeplink-state-mismatch", "");
                 return Err(i18n::tr("err.oauth.state"));
             }
-            let exchanged = match oauth::exchange_token(&provider, &code, &state, &mid) {
+            let exchanged = match oauth::exchange_token(&upstream, &code, &state, &mid) {
                 Ok(v) => v,
                 Err(e) => {
                     flowlog::log(&flow, "exchange-fail", &e);
                     return Err(e);
                 }
             };
-            match persist_oauth_account(&Paths::detect(), &provider, &exchanged["raw"], &flow, &mid, false) {
+            match persist_oauth_account(&Paths::detect(), &provider, &upstream, &exchanged["raw"], &flow, &mid, false) {
                 Ok(v) => {
                     flowlog::log(
                         &flow,
@@ -1270,6 +1322,7 @@ fn deeplink_err_soft(e: &str) -> bool {
 fn persist_oauth_account(
     paths: &Paths,
     provider: &str,
+    upstream: &str,
     raw: &serde_json::Value,
     flow: &str,
     mid: &str,
@@ -1291,8 +1344,11 @@ fn persist_oauth_account(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| i18n::tr("err.oauth.no_token"))?
         .to_string();
-    let raw_access = oauth::extract_access_token(provider, raw).unwrap_or_default();
-    let access_token = if provider == "zai" && !raw_access.is_empty() {
+    let raw_access = oauth::extract_access_token(upstream, raw).unwrap_or_default();
+    flowlog::log(&flow, "access", &format!("upstream={upstream} raw_len={}", raw_access.len()));
+    // zai_cn（国内直连）：poll 下发的 access_token 直接落库，不送全球区换证；
+    // zai（走代理 → 国际站）：仍需 /api/auth/z/login 换业务令牌。
+    let access_token = if upstream == "zai" && !raw_access.is_empty() {
         oauth::resolve_zai_business_token(&raw_access).ok_or_else(|| i18n::tr("err.oauth.zai_business"))?
     } else {
         raw_access
@@ -1300,11 +1356,11 @@ fn persist_oauth_account(
     let userinfo = if poll_ready {
         oauth::extract_poll_user_profile(raw)
     } else {
-        oauth::extract_user_profile(provider, raw)
+        oauth::extract_user_profile(upstream, raw)
     }
     .or_else(|| {
         (!access_token.is_empty())
-            .then(|| oauth::fetch_userinfo(provider, &access_token))
+            .then(|| oauth::fetch_userinfo(upstream, &access_token))
             .flatten()
     });
     let refresh_token = oauth::extract_refresh_token(provider, raw);
@@ -1385,7 +1441,7 @@ fn finalize_oauth_result(app: &AppHandle, result: Result<serde_json::Value, Stri
     let _ = app.emit("oauth://done", &payload);
 }
 
-fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, cfg: PollCfg) {
+fn spawn_poll_loop(app: AppHandle, provider: String, upstream: String, flow: String, mid: String, cfg: PollCfg) {
     std::thread::spawn(move || {
         let ours = || pending_oauth_guard().as_ref().map(|p| p.flow == flow).unwrap_or(false);
         let deadline = {
@@ -1405,7 +1461,7 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
                 Ok(oauth::PollOutcome::Ready(data)) => {
                     flowlog::log(&flow, "poll-ready", "");
                     let raw = json!({ "code": 0, "data": data });
-                    let result = persist_oauth_account(&Paths::detect(), &provider, &raw, &flow, &mid, true);
+                    let result = persist_oauth_account(&Paths::detect(), &provider, &upstream, &raw, &flow, &mid, true);
                     match &result {
                         Ok(v) => flowlog::log(
                             &flow,

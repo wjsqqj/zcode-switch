@@ -312,12 +312,13 @@ mod tests {
     #[test]
     fn version_status_fresh_cache_reports_latest() {
         let home = temp_home("fresh");
-        write_cache_json(&home, "3.17.2", 60);
+        let v = crate::quota::CLIENT_APP_VERSION;
+        write_cache_json(&home, v, 60);
         let s = version_status(&home);
         assert!(!s.stale);
-        assert_eq!(s.latest.as_deref(), Some("3.17.2"));
-        assert_eq!(s.reported, "3.17.2");
-        assert!(!s.constant_behind, "常量已升到 3.17.2，不应落后");
+        assert_eq!(s.latest.as_deref(), Some(v));
+        assert_eq!(s.reported, v);
+        assert!(!s.constant_behind, "缓存与常量同为 {v}，不应落后");
         assert!(s.cache_age_secs.unwrap() >= 60);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -329,7 +330,7 @@ mod tests {
         write_cache_json(&home, "99.0.0", 10);
         let s = version_status(&home);
         assert_eq!(s.reported, "99.0.0", "上报取 max(常量, 缓存)");
-        assert!(s.constant_behind, "常量 3.17.2 < 99.0.0，必须标记落后");
+        assert!(s.constant_behind, "常量低于 99.0.0，必须标记落后");
         let _ = std::fs::remove_dir_all(&home);
     }
 
